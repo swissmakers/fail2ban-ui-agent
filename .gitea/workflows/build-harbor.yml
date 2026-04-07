@@ -38,10 +38,14 @@ jobs:
 
       - name: Build multi-arch manifest
         env:
-          # Image name for this repository (was fail2ban-ui by mistake).
           LOCAL_MANIFEST: localhost/fail2ban-ui-agent:${{ github.sha }}
           PLATFORMS: linux/amd64,linux/arm64
         run: |
+          set -euo pipefail
+          # Explicit root for runners where defaults differ (e.g. act)
+          cd "${GITHUB_WORKSPACE:-$(pwd)}"
+          test -f Dockerfile || { echo "::error::Dockerfile missing at repo root"; ls -la; exit 1; }
+          test -d docker/linuxserver/custom-services.d || { echo "::error::Commit docker/linuxserver/ (hooks for the LinuxServer image)"; ls -la; exit 1; }
           podman build --pull \
             --platform "$PLATFORMS" \
             --manifest "$LOCAL_MANIFEST" \

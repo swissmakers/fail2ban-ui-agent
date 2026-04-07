@@ -1,5 +1,4 @@
-# Binaries for programs and plugins
-fail2ban-ui-agent
+/fail2ban-ui-agent
 
 # Test binary, built with `go test -c`
 *.test
