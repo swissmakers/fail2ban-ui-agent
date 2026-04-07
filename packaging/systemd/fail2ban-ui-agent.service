@@ -1,0 +1,19 @@
+[Unit]
+Description=Fail2ban UI Agent
+After=network.target fail2ban.service
+Wants=fail2ban.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=AGENT_BIND_ADDRESS=0.0.0.0
+Environment=AGENT_PORT=9443
+EnvironmentFile=-/etc/default/fail2ban-ui-agent
+ExecStart=/usr/bin/fail2ban-ui-agent
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

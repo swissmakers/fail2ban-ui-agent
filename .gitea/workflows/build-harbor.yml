@@ -1,0 +1,72 @@
+# fail2ban-ui-agent: LinuxServer fail2ban base + static Go binary (see root Dockerfile).
+# Multi-arch: builder uses TARGETARCH per platform; non-native arches use QEMU (binfmt step).
+# Requires linuxserver/fail2ban multi-arch manifest (linux/amd64, linux/arm64).
+
+name: Build fail2ban-ui-agent multi-arch image and push to Harbor / Docker Hub
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: linux_amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable binfmt/QEMU for cross-arch RUN steps
+        run: |
+          podman run --privileged --rm docker.io/tonistiigi/binfmt --install all
+
+      - name: Login to Swissmakers Registry
+        if: ${{ secrets.HARBOR_REGISTRY && secrets.HARBOR_USERNAME && secrets.HARBOR_PASSWORD }}
+        env:
+          REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          ROBOT_USER: ${{ secrets.HARBOR_USERNAME }}
+          ROBOT_PASS: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          echo "$ROBOT_PASS" | podman login --username "$ROBOT_USER" --password-stdin "$REGISTRY"
+
+      - name: Login to Docker Hub
+        if: ${{ secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN }}
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          echo "$DH_TOKEN" | podman login docker.io --username "$DH_USER" --password-stdin
+
+      - name: Build multi-arch manifest
+        env:
+          # Image name for this repository (was fail2ban-ui by mistake).
+          LOCAL_MANIFEST: localhost/fail2ban-ui-agent:${{ github.sha }}
+          PLATFORMS: linux/amd64,linux/arm64
+        run: |
+          podman build --pull \
+            --platform "$PLATFORMS" \
+            --manifest "$LOCAL_MANIFEST" \
+            -f Dockerfile \
+            .
+          podman manifest inspect "$LOCAL_MANIFEST"
+
+      - name: Push to Swissmakers Registry (Harbor)
+        if: ${{ secrets.HARBOR_REGISTRY && secrets.HARBOR_USERNAME && secrets.HARBOR_PASSWORD && secrets.HARBOR_PROJECT }}
+        env:
+          REG: ${{ secrets.HARBOR_REGISTRY }}
+          PROJ: ${{ secrets.HARBOR_PROJECT }}
+          LOCAL_MANIFEST: localhost/fail2ban-ui-agent:${{ github.sha }}
+        run: |
+          DEST="docker://$REG/$PROJ/fail2ban-ui-agent"
+          podman manifest push --all "$LOCAL_MANIFEST" "$DEST:${{ github.sha }}"
+          podman manifest push --all "$LOCAL_MANIFEST" "$DEST:latest"
+
+      - name: Push to Docker Hub
+        if: ${{ secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN }}
+        env:
+          DH_NS: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_REPO: fail2ban-ui-agent
+          LOCAL_MANIFEST: localhost/fail2ban-ui-agent:${{ github.sha }}
+        run: |
+          DEST="docker://docker.io/$DH_NS/$DH_REPO"
+          podman manifest push --all "$LOCAL_MANIFEST" "$DEST:${{ github.sha }}"
+          podman manifest push --all "$LOCAL_MANIFEST" "$DEST:latest"

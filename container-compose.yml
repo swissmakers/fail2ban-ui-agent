@@ -1,0 +1,25 @@
+# Example: run from repo root — paths below assume development/ssh_and_local for config + jail fix hook.
+#   podman compose -f _dev/fail2ban-ui-agent/container-compose.yml up -d --build
+services:
+  fail2ban-agent:
+    image: swissmakers/fail2ban-ui-agent:latest
+    container_name: fail2ban-ui-agent
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    network_mode: host
+    environment:
+      - AGENT_SECRET=agent-secret-change-me
+      - AGENT_BIND_ADDRESS=0.0.0.0
+      #- AGENT_PORT=9700
+      - TZ=Europe/Zurich
+      - VERBOSITY=-vv
+      #- PUID=0
+      #- PGID=0
+    volumes:
+      # Configuration
+      - /opt/fail2ban-with-agent:/config:z
+      # Example log sources for fail2ban container
+      - /var/log:/var/log:ro
+      - /var/log/httpd:/remotelogs/apache2:ro
+    restart: unless-stopped

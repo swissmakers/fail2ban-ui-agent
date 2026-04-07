@@ -1,0 +1,10 @@
+#!/usr/bin/with-contenv bash
+# fail2ban-ui-agent binary is built into this image at build time.
+set -euo pipefail
+
+DST=/usr/local/bin/fail2ban-ui-agent
+if [ ! -x "$DST" ]; then
+  echo "[custom-init] ERROR: $DST missing or not executable"
+  exit 1
+fi
+echo "[custom-init] fail2ban-ui-agent: binary OK ($DST)"
