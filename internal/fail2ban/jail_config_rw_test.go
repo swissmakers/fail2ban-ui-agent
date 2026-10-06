@@ -46,29 +46,6 @@ func TestReadJailConfigWithFallbackConfOnly(t *testing.T) {
 	}
 }
 
-func TestEnsureJailLocalFileCopiesFromConf(t *testing.T) {
-	root := t.TempDir()
-	jd := filepath.Join(root, "jail.d")
-	if err := os.MkdirAll(jd, 0755); err != nil {
-		t.Fatal(err)
-	}
-	want := "[j]\nfilter = f\n"
-	if err := os.WriteFile(filepath.Join(jd, "j.conf"), []byte(want), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := ensureJailLocalFile("j", root); err != nil {
-		t.Fatal(err)
-	}
-	local := filepath.Join(jd, "j.local")
-	raw, err := os.ReadFile(local)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(raw) != want {
-		t.Fatalf("local = %q", raw)
-	}
-}
-
 func TestApplyJailEnabledInContent(t *testing.T) {
 	in := "[sshd]\nport = ssh\n"
 	got := applyJailEnabledInContent(in, "sshd", true)
@@ -87,7 +64,7 @@ func TestServiceGetJailConfigConfOnly(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(jd, "x.conf"), []byte(want), 0644); err != nil {
 		t.Fatal(err)
 	}
-	s := NewService(root, "/tmp", "/var/log")
+	s := NewService(root, "/var/log")
 	got, path, err := s.GetJailConfig("x")
 	if err != nil {
 		t.Fatal(err)
@@ -109,7 +86,7 @@ func TestServiceUpdateJailEnabledStatesFromConfOnly(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(jd, "z.conf"), []byte("[z]\nenabled = false\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	s := NewService(root, "/tmp", "/var/log")
+	s := NewService(root, "/var/log")
 	if err := s.UpdateJailEnabledStates(map[string]bool{"z": true}); err != nil {
 		t.Fatal(err)
 	}

@@ -26,11 +26,33 @@ type JailInfo struct {
 	Enabled       bool     `json:"enabled"`
 }
 
+// The json-tagged fields form the supervisor block of /v1/health.
 type HealthState struct {
-	Healthy          bool      `json:"healthy"`
-	LastCheck        time.Time `json:"lastCheck"`
-	LastSuccess      time.Time `json:"lastSuccess"`
-	LastError        string    `json:"lastError,omitempty"`
-	LastRemediation  string    `json:"lastRemediation,omitempty"`
-	ConsecutiveFails int       `json:"consecutiveFails"`
+	PingOK         bool        `json:"-"`
+	Env            Environment `json:"-"`
+	StoppedByAdmin bool        `json:"-"`
+
+	LastCheck            time.Time `json:"lastCheck,omitzero"`
+	LastSuccess          time.Time `json:"lastSuccess,omitzero"`
+	LastError            string    `json:"lastError,omitempty"`
+	ConsecutiveFails     int       `json:"consecutiveFails"`
+	LastRemediation      string    `json:"lastRemediation,omitempty"`
+	LastRemediationAt    time.Time `json:"lastRemediationAt,omitzero"`
+	RemediationAttempts  int       `json:"remediationAttempts"`
+	RemediationSuspended bool      `json:"remediationSuspended"`
+}
+
+// Host prerequisites checked alongside each ping.
+type Environment struct {
+	ConfigWritable bool
+	Fail2banClient bool
+	Fail2banRegex  bool
+}
+
+type ReadyChecks struct {
+	Ping           bool `json:"ping"`
+	ConfigWritable bool `json:"configWritable"`
+	Fail2banClient bool `json:"fail2banClient"`
+	Fail2banRegex  bool `json:"fail2banRegex"`
+	Fresh          bool `json:"fresh"`
 }

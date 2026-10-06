@@ -27,28 +27,114 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/swissmakers/fail2ban-ui-agent/internal/fsutil"
 	"github.com/swissmakers/fail2ban-ui-agent/internal/model"
 )
 
-type Service struct {
-	configRoot string
-	runRoot    string
-	logRoot    string
+const (
+	shortCommandTimeout = 15 * time.Second
+	longCommandTimeout  = 45 * time.Second
+	maxCommandOutput    = 64 << 10
+	maxIncludeDepth     = 3
+	// W_OK
+	accessWriteOK = 0x2
+
+	agentManagedMarker   = "managed by fail2ban-ui-agent"
+	legacyUIActionMarker = "ui-custom-action"
+
+	// The dot keeps the temp filter name out of validIncludeName's namespace, so no copied include can overwrite it.
+	testFilterFile = "agent.filter-under-test.conf"
+)
+
+// Per service-manager budget; a variable so tests can shorten it.
+var restartTimeout = longCommandTimeout
+
+var restartCommands = [][]string{
+	{"systemctl", "restart", "fail2ban"},
+	{"service", "fail2ban", "restart"},
+	{"rc-service", "fail2ban", "restart"},
 }
 
-func NewService(configRoot, runRoot, logRoot string) *Service {
+type Service struct {
+	configRoot string
+	logRoot    string
+	// Serializes reload/restart/validate between the API and the supervisor; a channel so waiting honours ctx.
+	svcLock chan struct{}
+}
+
+func NewService(configRoot, logRoot string) *Service {
 	return &Service{
 		configRoot: strings.TrimRight(configRoot, "/"),
-		runRoot:    strings.TrimRight(runRoot, "/"),
 		logRoot:    strings.TrimRight(logRoot, "/"),
+		svcLock:    make(chan struct{}, 1),
 	}
 }
 
+func (s *Service) lockService(ctx context.Context) error {
+	select {
+	case s.svcLock <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for another reload/restart/validate: %w", ctx.Err())
+	}
+}
+
+func (s *Service) unlockService() { <-s.svcLock }
+
+// Ping succeeds only when the server actually answered "pong".
 func (s *Service) Ping(ctx context.Context) error {
-	_, err := s.client(ctx, "ping")
-	return err
+	out, err := s.client(ctx, shortCommandTimeout, "ping")
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(out, "pong") {
+		return fmt.Errorf("fail2ban-client ping: unexpected reply %q", capOutput([]byte(strings.TrimSpace(out)), 256))
+	}
+	return nil
+}
+
+func (s *Service) Version(ctx context.Context) (string, error) {
+	out, err := s.client(ctx, shortCommandTimeout, "version")
+	if err != nil {
+		return "", err
+	}
+	line, _, _ := strings.Cut(strings.TrimSpace(out), "\n")
+	return capOutput([]byte(strings.TrimSpace(line)), 64), nil
+}
+
+func (s *Service) Environment() model.Environment {
+	_, clientErr := exec.LookPath("fail2ban-client")
+	_, regexErr := exec.LookPath("fail2ban-regex")
+	return model.Environment{
+		ConfigWritable: syscall.Access(s.configRoot, accessWriteOK) == nil,
+		Fail2banClient: clientErr == nil,
+		Fail2banRegex:  regexErr == nil,
+	}
+}
+
+// Reports whether systemd knows fail2ban as deliberately stopped ("inactive", not "failed").
+func (s *Service) StoppedByAdmin(ctx context.Context) bool {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, "systemctl", "show", "fail2ban", "--property=LoadState,ActiveState").Output()
+	return unitStoppedByAdmin(string(out))
+}
+
+// An unknown unit also reports "inactive", so only a loaded unit counts as stopped on purpose.
+func unitStoppedByAdmin(show string) bool {
+	props := map[string]string{}
+	for _, line := range strings.Split(show, "\n") {
+		if k, v, ok := strings.Cut(strings.TrimSpace(line), "="); ok {
+			props[k] = v
+		}
+	}
+	return props["LoadState"] == "loaded" && props["ActiveState"] == "inactive"
 }
 
 func (s *Service) GetJailInfos(ctx context.Context) ([]model.JailInfo, error) {
@@ -75,7 +161,7 @@ func (s *Service) GetJailInfos(ctx context.Context) ([]model.JailInfo, error) {
 }
 
 func (s *Service) GetJails(ctx context.Context) ([]string, error) {
-	out, err := s.client(ctx, "status")
+	out, err := s.client(ctx, shortCommandTimeout, "status")
 	if err != nil {
 		return nil, err
 	}
@@ -108,15 +194,11 @@ func (s *Service) GetBannedIPs(ctx context.Context, jail string) ([]string, int,
 	if err := ValidateJailName(jail); err != nil {
 		return nil, 0, err
 	}
-	ips, count, err := s.getBannedInfo(ctx, strings.TrimSpace(jail))
-	if err != nil {
-		return nil, 0, err
-	}
-	return ips, count, nil
+	return s.getBannedInfo(ctx, strings.TrimSpace(jail))
 }
 
 func (s *Service) getBannedInfo(ctx context.Context, jail string) ([]string, int, error) {
-	out, err := s.client(ctx, "status", jail)
+	out, err := s.client(ctx, shortCommandTimeout, "status", jail)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -152,7 +234,7 @@ func (s *Service) BanIP(ctx context.Context, jail, ip string) error {
 	if err := ValidateIP(ip); err != nil {
 		return err
 	}
-	_, err := s.client(ctx, "set", strings.TrimSpace(jail), "banip", strings.TrimSpace(ip))
+	_, err := s.client(ctx, shortCommandTimeout, "set", strings.TrimSpace(jail), "banip", strings.TrimSpace(ip))
 	return err
 }
 
@@ -163,43 +245,64 @@ func (s *Service) UnbanIP(ctx context.Context, jail, ip string) error {
 	if err := ValidateIP(ip); err != nil {
 		return err
 	}
-	_, err := s.client(ctx, "set", strings.TrimSpace(jail), "unbanip", strings.TrimSpace(ip))
+	_, err := s.client(ctx, shortCommandTimeout, "set", strings.TrimSpace(jail), "unbanip", strings.TrimSpace(ip))
 	return err
 }
 
-func (s *Service) Reload(ctx context.Context) error {
-	_, err := s.ReloadWithOutput(ctx)
-	return err
+func (s *Service) Reload(ctx context.Context) (string, error) {
+	if err := s.lockService(ctx); err != nil {
+		return "", err
+	}
+	defer s.unlockService()
+	return s.client(ctx, longCommandTimeout, "reload")
 }
 
-func (s *Service) ReloadWithOutput(ctx context.Context) (string, error) {
-	return s.client(ctx, "reload")
+// Restart returns "restart" when a service manager restarted fail2ban, or "reload" when it fell back to a reload.
+func (s *Service) Restart(ctx context.Context) (string, error) {
+	if err := s.lockService(ctx); err != nil {
+		return "", err
+	}
+	defer s.unlockService()
+	var errs []error
+	for _, c := range restartCommands {
+		if _, err := exec.LookPath(c[0]); err != nil {
+			continue
+		}
+		if _, err := runCommand(ctx, restartTimeout, c[0], c[1:]...); err != nil {
+			// A manager that timed out may still be restarting; starting a second one would queue another restart.
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				return "restart", err
+			}
+			errs = append(errs, err)
+			continue
+		}
+		return "restart", nil
+	}
+	// fallback if service manager is unavailable or failed
+	if _, err := s.client(ctx, longCommandTimeout, "reload"); err != nil {
+		return "reload", errors.Join(append(errs, fmt.Errorf("fallback reload: %w", err))...)
+	}
+	return "reload", nil
 }
 
-func (s *Service) Restart(ctx context.Context) error {
-	candidates := [][]string{
-		{"systemctl", "restart", "fail2ban"},
-		{"service", "fail2ban", "restart"},
-		{"rc-service", "fail2ban", "restart"},
+// Validate runs `fail2ban-client -t`; a failed test wraps ErrConfigInvalid, anything else means it could not run.
+func (s *Service) Validate(ctx context.Context) (string, error) {
+	if err := s.lockService(ctx); err != nil {
+		return "", err
 	}
-	var lastErr error
-	for _, c := range candidates {
-		cmd := exec.CommandContext(ctx, c[0], c[1:]...)
-		if out, err := cmd.CombinedOutput(); err == nil {
-			_ = out
-			return nil
-		} else {
-			lastErr = fmt.Errorf("%s: %w (%s)", strings.Join(c, " "), err, strings.TrimSpace(string(out)))
-		}
+	defer s.unlockService()
+	ctx, cancel := context.WithTimeout(ctx, longCommandTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "fail2ban-client", "-c", s.configRoot, "-t").CombinedOutput()
+	output := capOutput(out, maxCommandOutput)
+	if err == nil {
+		return output, nil
 	}
-	// fallback if service manager is unavailable
-	if _, err := s.ReloadWithOutput(ctx); err != nil {
-		if lastErr != nil {
-			return fmt.Errorf("%v; fallback reload failed: %w", lastErr, err)
-		}
-		return err
+	var exitErr *exec.ExitError
+	if ctx.Err() == nil && errors.As(err, &exitErr) && exitErr.Exited() {
+		return output, fmt.Errorf("%w (exit status %d)", ErrConfigInvalid, exitErr.ExitCode())
 	}
-	return nil
+	return output, fmt.Errorf("fail2ban-client -t: %w", err)
 }
 
 func (s *Service) GetFilterConfig(name string) (string, string, error) {
@@ -218,31 +321,37 @@ func (s *Service) SetFilterConfig(name, content string) error {
 	if err := ValidateFilterName(name); err != nil {
 		return err
 	}
-	name = strings.TrimSpace(name)
-	p := filepath.Join(s.configRoot, "filter.d", name+".local")
+	p := filepath.Join(s.configRoot, "filter.d", strings.TrimSpace(name)+".local")
 	if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(p, []byte(content), 0644)
+	return fsutil.WriteConfig(p, []byte(content), 0644)
 }
 
 func (s *Service) GetFilters() ([]string, error) {
-	dir := filepath.Join(s.configRoot, "filter.d")
-	entries, err := os.ReadDir(dir)
+	entries, err := os.ReadDir(filepath.Join(s.configRoot, "filter.d"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return []string{}, nil
+	}
 	if err != nil {
 		return nil, err
 	}
+	return filterNamesFromEntries(entries), nil
+}
+
+// Unique, sorted filter names from .conf/.local files; names the API could not address (dotfiles included) are skipped.
+func filterNamesFromEntries(entries []fs.DirEntry) []string {
 	set := map[string]struct{}{}
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		name := e.Name()
-		if strings.HasSuffix(name, ".conf") || strings.HasSuffix(name, ".local") {
-			base := strings.TrimSuffix(strings.TrimSuffix(name, ".conf"), ".local")
-			if base != "" {
-				set[base] = struct{}{}
-			}
+		base, ok := strings.CutSuffix(e.Name(), ".conf")
+		if !ok {
+			base, ok = strings.CutSuffix(e.Name(), ".local")
+		}
+		if ok && ValidateFilterName(base) == nil {
+			set[base] = struct{}{}
 		}
 	}
 	out := make([]string, 0, len(set))
@@ -250,62 +359,122 @@ func (s *Service) GetFilters() ([]string, error) {
 		out = append(out, f)
 	}
 	sort.Strings(out)
-	return out, nil
+	return out
 }
 
-func (s *Service) TestFilter(ctx context.Context, filterName string, logLines []string, filterContent string) (string, string, error) {
+// TestFilter runs fail2ban-regex; any normal exit returns its exit code, err is set only when it could not run.
+func (s *Service) TestFilter(ctx context.Context, filterName string, logLines []string, filterContent string) (string, string, int, error) {
 	if err := ValidateFilterName(filterName); err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
 	filterName = strings.TrimSpace(filterName)
 
-	var filterPath string
-	if strings.TrimSpace(filterContent) != "" {
-		// Ad-hoc content: write to a private temp dir with a randomised file name
-		// (never derived from caller input) so it cannot collide or traverse.
-		tmpDir, err := os.MkdirTemp("", "f2b-agent-test-")
-		if err != nil {
-			return "", "", err
-		}
-		defer os.RemoveAll(tmpDir)
-		filterPath = filepath.Join(tmpDir, "filter.conf")
-		if err := os.WriteFile(filterPath, []byte(filterContent), 0600); err != nil {
-			return "", "", err
-		}
-		logPath := filepath.Join(tmpDir, "logs.log")
-		if err := os.WriteFile(logPath, []byte(strings.Join(logLines, "\n")), 0600); err != nil {
-			return "", "", err
-		}
-		cmd := exec.CommandContext(ctx, "fail2ban-regex", logPath, filterPath)
-		out, err := cmd.CombinedOutput()
-		return string(out), filterPath, err
-	}
-
-	filterPath, err := s.pickFilterPath(filterName)
-	if err != nil {
-		return "", "", err
-	}
+	// Private temp dir with fixed file names (never derived from caller input) so nothing can collide or traverse.
 	tmpDir, err := os.MkdirTemp("", "f2b-agent-test-")
 	if err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
 	defer os.RemoveAll(tmpDir)
-	logPath := filepath.Join(tmpDir, "logs.log")
-	if err := os.WriteFile(logPath, []byte(strings.Join(logLines, "\n")), 0600); err != nil {
-		return "", "", err
+
+	var filterPath string
+	if strings.TrimSpace(filterContent) != "" {
+		if !strings.HasSuffix(filterContent, "\n") {
+			filterContent += "\n"
+		}
+		filterPath = filepath.Join(tmpDir, testFilterFile)
+		if err := os.WriteFile(filterPath, []byte(filterContent), 0600); err != nil {
+			return "", "", 0, err
+		}
+		if err := copyFilterIncludes(filepath.Join(s.configRoot, "filter.d"), tmpDir, filterName, filterContent); err != nil {
+			return "", filterPath, 0, err
+		}
+	} else if filterPath, err = s.pickFilterPath(filterName); err != nil {
+		return "", "", 0, err
 	}
 
-	cmd := exec.CommandContext(ctx, "fail2ban-regex", logPath, filterPath)
-	out, err := cmd.CombinedOutput()
-	return string(out), filterPath, err
+	logPath := filepath.Join(tmpDir, "test.log")
+	if err := os.WriteFile(logPath, []byte(strings.Join(logLines, "\n")+"\n"), 0600); err != nil {
+		return "", filterPath, 0, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, longCommandTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "fail2ban-regex", logPath, filterPath).CombinedOutput()
+	if err == nil {
+		return string(out), filterPath, 0, nil
+	}
+	var exitErr *exec.ExitError
+	if ctx.Err() == nil && errors.As(err, &exitErr) && exitErr.Exited() {
+		return string(out), filterPath, exitErr.ExitCode(), nil
+	}
+	return string(out), filterPath, 0, fmt.Errorf("fail2ban-regex: %w", err)
+}
+
+// Copies content's [INCLUDES] closure plus .local siblings from filterDir into dst, where fail2ban-regex looks for them.
+func copyFilterIncludes(filterDir, dst, filterName, content string) error {
+	visited := map[string]bool{filterName: true}
+	var walk func(content string, depth int) error
+	walk = func(content string, depth int) error {
+		if depth > maxIncludeDepth {
+			return nil
+		}
+		for _, inc := range parseFilterIncludes(content) {
+			if !validIncludeName(inc) {
+				continue
+			}
+			base := strings.TrimSuffix(strings.TrimSuffix(inc, ".conf"), ".local")
+			if visited[base] {
+				continue
+			}
+			visited[base] = true
+			for _, ext := range []string{".conf", ".local"} {
+				raw, err := os.ReadFile(filepath.Join(filterDir, base+ext))
+				if err != nil {
+					continue
+				}
+				if err := os.WriteFile(filepath.Join(dst, base+ext), raw, 0600); err != nil {
+					return err
+				}
+				if err := walk(string(raw), depth+1); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	return walk(content, 1)
+}
+
+// Returns the before/after file names of the [INCLUDES] section, including continuation lines.
+func parseFilterIncludes(content string) []string {
+	var out []string
+	inIncludes, inValue := false, false
+	for _, line := range strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "["):
+			inIncludes = strings.EqualFold(trimmed, "[INCLUDES]")
+			inValue = false
+		case !inIncludes || trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";"):
+			inValue = false
+		case inValue && (line[0] == ' ' || line[0] == '\t'):
+			out = append(out, strings.Fields(trimmed)...)
+		default:
+			key, value, ok := strings.Cut(trimmed, "=")
+			key = strings.ToLower(strings.TrimSpace(key))
+			inValue = ok && (key == "before" || key == "after")
+			if inValue {
+				out = append(out, strings.Fields(value)...)
+			}
+		}
+	}
+	return out
 }
 
 func (s *Service) GetJailConfig(jail string) (string, string, error) {
 	if err := ValidateJailName(jail); err != nil {
 		return "", "", err
 	}
-	jail = strings.TrimSpace(jail)
-	return readJailConfigWithFallback(jail, s.configRoot)
+	return readJailConfigWithFallback(strings.TrimSpace(jail), s.configRoot)
 }
 
 func (s *Service) SetJailConfig(jail, content string) error {
@@ -313,78 +482,108 @@ func (s *Service) SetJailConfig(jail, content string) error {
 		return err
 	}
 	jail = strings.TrimSpace(jail)
-	if err := ensureJailLocalFile(jail, s.configRoot); err != nil {
-		return err
-	}
-	p := filepath.Join(s.configRoot, "jail.d", jail+".local")
 	if strings.TrimSpace(content) == "" {
 		content = fmt.Sprintf("[%s]\n", jail)
 	}
-	return os.WriteFile(p, []byte(content), 0644)
+	return writeJailLocal(s.configRoot, jail, content)
+}
+
+func (s *Service) CreateJail(name, content string) error {
+	if err := ValidateJailName(name); err != nil {
+		return err
+	}
+	name = strings.TrimSpace(name)
+	return writeJailLocal(s.configRoot, name, ensureSectionHeader(name, content))
+}
+
+// Prepends [name] unless the content already defines that section.
+func ensureSectionHeader(name, content string) string {
+	header := "[" + name + "]"
+	for _, line := range strings.Split(content, "\n") {
+		if strings.TrimSpace(line) == header {
+			return content
+		}
+	}
+	if strings.TrimSpace(content) == "" {
+		return header + "\n"
+	}
+	return header + "\n" + content
 }
 
 func (s *Service) UpdateJailEnabledStates(updates map[string]bool) error {
-	for jail, enabled := range updates {
+	for jail := range updates {
 		if err := ValidateJailName(jail); err != nil {
 			return err
 		}
+	}
+	for jail, enabled := range updates {
 		jail = strings.TrimSpace(jail)
-		if err := ensureJailLocalFile(jail, s.configRoot); err != nil {
-			return fmt.Errorf("jail %q: %w", jail, err)
-		}
 		content, _, err := readJailConfigWithFallback(jail, s.configRoot)
 		if err != nil {
 			return err
 		}
-		content = applyJailEnabledInContent(content, jail, enabled)
-		path := filepath.Join(s.configRoot, "jail.d", jail+".local")
-		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-			return err
+		if err := writeJailLocal(s.configRoot, jail, applyJailEnabledInContent(content, jail, enabled)); err != nil {
+			return fmt.Errorf("jail %q: %w", jail, err)
 		}
 	}
 	return nil
 }
 
 func (s *Service) TestLogpath(pattern string) ([]string, error) {
-	p := strings.TrimSpace(pattern)
+	p, err := ValidateLogpath(pattern)
+	if err != nil {
+		return nil, err
+	}
 	if p == "" {
 		return []string{}, nil
 	}
+	return listLogpath(p)
+}
 
-	hasWildcard := strings.ContainsAny(p, "*?[")
-	if hasWildcard {
+// Lists the files a validated logpath matches; permission errors map to ErrLogpathInaccessible.
+func listLogpath(p string) ([]string, error) {
+	if strings.ContainsAny(p, "*?[") {
 		files, err := filepath.Glob(p)
 		if err != nil {
-			return nil, fmt.Errorf("invalid glob pattern: %w", err)
+			return nil, fmt.Errorf("%w: invalid glob pattern: %v", ErrLogpathInvalid, err)
+		}
+		if len(files) == 0 {
+			if _, err := os.ReadDir(filepath.Dir(p)); errors.Is(err, fs.ErrPermission) {
+				return nil, fmt.Errorf("%w: %s", ErrLogpathInaccessible, filepath.Dir(p))
+			}
+			return []string{}, nil
 		}
 		sort.Strings(files)
 		return files, nil
 	}
 
 	info, err := os.Stat(p)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return []string{}, nil
-		}
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return []string{}, nil
+	case errors.Is(err, fs.ErrPermission):
+		return nil, fmt.Errorf("%w: %s", ErrLogpathInaccessible, p)
+	case err != nil:
 		return nil, fmt.Errorf("failed to stat path: %w", err)
 	}
-
-	if info.IsDir() {
-		entries, err := os.ReadDir(p)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read directory: %w", err)
-		}
-		files := make([]string, 0, len(entries))
-		for _, entry := range entries {
-			if !entry.IsDir() {
-				files = append(files, filepath.Join(p, entry.Name()))
-			}
-		}
-		sort.Strings(files)
-		return files, nil
+	if !info.IsDir() {
+		return []string{p}, nil
 	}
-
-	return []string{p}, nil
+	entries, err := os.ReadDir(p)
+	if errors.Is(err, fs.ErrPermission) {
+		return nil, fmt.Errorf("%w: %s", ErrLogpathInaccessible, p)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to read directory: %w", err)
+	}
+	files := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			files = append(files, filepath.Join(p, entry.Name()))
+		}
+	}
+	sort.Strings(files)
+	return files, nil
 }
 
 func (s *Service) TestLogpathWithResolution(pattern string) (string, string, []string, error) {
@@ -407,37 +606,54 @@ func (s *Service) TestLogpathWithResolution(pattern string) (string, string, []s
 			}
 		}
 		if err != nil {
-			return original, "", nil, fmt.Errorf("failed to resolve logpath variables: %w", err)
+			return original, "", nil, fmt.Errorf("%w: %v", ErrLogpathUnresolved, err)
 		}
 	}
 	if resolved == "" {
 		resolved = original
 	}
-	if strings.HasPrefix(resolved, "/var/log") && s.logRoot != "/var/log" && s.logRoot != "" {
-		resolved = filepath.Join(strings.TrimRight(s.logRoot, "/"), strings.TrimPrefix(resolved, "/var/log"))
-	}
-	files, err := s.TestLogpath(resolved)
+	checked, err := ValidateLogpath(resolved)
 	if err != nil {
-		return original, resolved, nil, fmt.Errorf("failed to test logpath: %w", err)
+		return original, resolved, nil, err
+	}
+	resolved = remapLogRoot(checked, s.logRoot)
+	files, err := listLogpath(resolved)
+	if err != nil {
+		return original, resolved, nil, err
 	}
 	return original, resolved, files, nil
 }
 
-func (s *Service) CheckJailLocalState() (bool, bool, bool, error) {
-	return s.jailLocalState()
+// Moves a path under /var/log to logRoot (e.g. a container mount); /var/logfoo is left alone.
+func remapLogRoot(p, logRoot string) string {
+	if logRoot == "" || logRoot == "/var/log" {
+		return p
+	}
+	if p == "/var/log" {
+		return logRoot
+	}
+	if rest, ok := strings.CutPrefix(p, "/var/log/"); ok {
+		return filepath.Join(logRoot, rest)
+	}
+	return p
 }
 
-func (s *Service) jailLocalState() (exists bool, managed bool, hasLegacyUICustomAction bool, err error) {
-	p := filepath.Join(s.configRoot, "jail.local")
-	raw, err := os.ReadFile(p)
+// Reports whether jail.local exists, whether the agent or the UI manages it, and whether it still carries the legacy UI action.
+func (s *Service) CheckJailLocalState() (exists bool, managed bool, hasLegacyUIAction bool, err error) {
+	raw, err := os.ReadFile(filepath.Join(s.configRoot, "jail.local"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, false, false, nil
+	}
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return false, false, false, nil
-		}
 		return false, false, false, err
 	}
 	content := string(raw)
-	return true, strings.Contains(content, "managed by fail2ban-ui-agent"), strings.Contains(content, "ui-custom-action"), nil
+	return true, isManagedJailLocal(content), strings.Contains(content, legacyUIActionMarker), nil
+}
+
+// Files written by the agent or by the UI's local/SSH connectors (ui-custom-action) are ours to rewrite.
+func isManagedJailLocal(content string) bool {
+	return strings.Contains(content, agentManagedMarker) || strings.Contains(content, legacyUIActionMarker)
 }
 
 func stripLegacyUICustomActionLines(content string) string {
@@ -446,7 +662,7 @@ func stripLegacyUICustomActionLines(content string) string {
 	out := make([]string, 0, len(lines))
 	for _, line := range lines {
 		trim := strings.TrimSpace(strings.ToLower(line))
-		if trim == "action = ui-custom-action" || trim == "banaction = ui-custom-action" || strings.Contains(trim, "ui-custom-action") {
+		if strings.Contains(trim, legacyUIActionMarker) {
 			continue
 		}
 		if strings.HasPrefix(trim, "action_mwlg") || trim == "action = %(action_mwlg)s" {
@@ -464,109 +680,80 @@ func stripLegacyUICustomActionLines(content string) string {
 	return strings.TrimRight(result, "\n") + "\n"
 }
 
-func (s *Service) EnsureJailLocalStructureWithContent(content string) error {
-	p := filepath.Join(s.configRoot, "jail.local")
-	if exists, managed, _, err := s.jailLocalState(); err == nil && exists && !managed {
-		return nil
+// Writes the managed jail.local; returns a skip reason instead of touching a user-owned file.
+func (s *Service) EnsureJailLocalStructure(content string) (skipReason string, err error) {
+	exists, managed, _, err := s.CheckJailLocalState()
+	if err != nil {
+		return "", err
+	}
+	if exists && !managed {
+		return "unmanaged", nil
 	}
 	trimmed := strings.TrimSpace(content)
 	if trimmed == "" {
-		trimmed = "[DEFAULT]\n# managed by fail2ban-ui-agent\nbanaction = iptables-multiport\n"
+		trimmed = "[DEFAULT]\n# " + agentManagedMarker + "\nbanaction = iptables-multiport\n"
 	}
 	final := stripLegacyUICustomActionLines(trimmed)
-	if !strings.Contains(final, "managed by fail2ban-ui-agent") {
-		final = strings.TrimRight(final, "\n") + "\n# managed by fail2ban-ui-agent\n"
+	if !strings.Contains(final, agentManagedMarker) {
+		final = strings.TrimRight(final, "\n") + "\n# " + agentManagedMarker + "\n"
 	}
-	return os.WriteFile(p, []byte(final), 0644)
-}
-
-func (s *Service) CleanupLegacyUICustomAction() error {
-	p := filepath.Join(s.configRoot, "jail.local")
-	raw, err := os.ReadFile(p)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	content := string(raw)
-	cleaned := stripLegacyUICustomActionLines(content)
-	if cleaned == strings.TrimRight(content, "\n")+"\n" || cleaned == content {
-		return nil
-	}
-	if !strings.Contains(cleaned, "managed by fail2ban-ui-agent") {
-		cleaned = strings.TrimRight(cleaned, "\n") + "\n# managed by fail2ban-ui-agent\n"
-	}
-	return os.WriteFile(p, []byte(cleaned), 0644)
-}
-
-func (s *Service) CreateJail(name, content string) error {
-	return s.SetJailConfig(name, content)
+	return "", fsutil.WriteConfig(filepath.Join(s.configRoot, "jail.local"), []byte(final), 0644)
 }
 
 func (s *Service) DeleteJail(name string) error {
 	if err := ValidateJailName(name); err != nil {
 		return err
 	}
-	name = strings.TrimSpace(name)
-	jd := jailDDir(s.configRoot)
-	localPath := filepath.Join(jd, name+".local")
-	confPath := filepath.Join(jd, name+".conf")
-	var deleted int
-	if err := os.Remove(localPath); err == nil {
-		deleted++
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	if err := os.Remove(confPath); err == nil {
-		deleted++
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	if deleted == 0 {
-		return fmt.Errorf("jail file %s.local or %s.conf does not exist", name, name)
-	}
-	return nil
-}
-
-func (s *Service) CreateFilter(name, content string) error {
-	return s.SetFilterConfig(name, content)
+	return removeLocalAndConf(jailDDir(s.configRoot), strings.TrimSpace(name), "jail")
 }
 
 func (s *Service) DeleteFilter(name string) error {
 	if err := ValidateFilterName(name); err != nil {
 		return err
 	}
-	name = strings.TrimSpace(name)
-	fd := filepath.Join(s.configRoot, "filter.d")
-	localPath := filepath.Join(fd, name+".local")
-	confPath := filepath.Join(fd, name+".conf")
+	return removeLocalAndConf(filepath.Join(s.configRoot, "filter.d"), strings.TrimSpace(name), "filter")
+}
+
+func removeLocalAndConf(dir, name, kind string) error {
 	var deleted int
-	if err := os.Remove(localPath); err == nil {
-		deleted++
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	if err := os.Remove(confPath); err == nil {
-		deleted++
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
+	for _, ext := range []string{".local", ".conf"} {
+		path := filepath.Join(dir, name+ext)
+		if err := os.Remove(path); err == nil {
+			deleted++
+			_ = os.Remove(path + fsutil.BackupSuffix)
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
 	}
 	if deleted == 0 {
-		return fmt.Errorf("filter file %s.local or %s.conf does not exist", name, name)
+		return fmt.Errorf("%w: %s file %s.local or %s.conf does not exist", ErrNotFound, kind, name, name)
 	}
 	return nil
 }
 
-func (s *Service) client(ctx context.Context, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+// Every fail2ban-client call reads the config tree (and thus the socket path) from the agent's config root.
+func (s *Service) client(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
+	return runCommand(ctx, timeout, "fail2ban-client", append([]string{"-c", s.configRoot}, args...)...)
+}
+
+func runCommand(ctx context.Context, timeout time.Duration, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "fail2ban-client", args...)
-	out, err := cmd.CombinedOutput()
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	if ctxErr := ctx.Err(); err != nil && ctxErr != nil {
+		return "", fmt.Errorf("%s %s did not finish: %w", name, strings.Join(args, " "), ctxErr)
+	}
 	if err != nil {
-		return "", fmt.Errorf("fail2ban-client %s failed: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("%s %s failed: %w (%s)", name, strings.Join(args, " "), err, capOutput([]byte(strings.TrimSpace(string(out))), 4096))
 	}
 	return string(out), nil
+}
+
+func capOutput(out []byte, limit int) string {
+	if len(out) <= limit {
+		return string(out)
+	}
+	return string(out[:limit]) + "\n[output truncated]"
 }
 
 func (s *Service) pickFilterPath(name string) (string, error) {
@@ -574,15 +761,13 @@ func (s *Service) pickFilterPath(name string) (string, error) {
 		return "", err
 	}
 	name = strings.TrimSpace(name)
-	local := filepath.Join(s.configRoot, "filter.d", name+".local")
-	if _, err := os.Stat(local); err == nil {
-		return local, nil
+	for _, ext := range []string{".local", ".conf"} {
+		p := filepath.Join(s.configRoot, "filter.d", name+ext)
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
 	}
-	conf := filepath.Join(s.configRoot, "filter.d", name+".conf")
-	if _, err := os.Stat(conf); err == nil {
-		return conf, nil
-	}
-	return "", fmt.Errorf("filter %s not found", name)
+	return "", fmt.Errorf("%w: filter %s", ErrNotFound, name)
 }
 
 func parseIntAfterColon(line string) int {

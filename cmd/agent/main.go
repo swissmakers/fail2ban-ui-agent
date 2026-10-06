@@ -40,16 +40,21 @@ func main() {
 		log.Fatalf("config error: %v", err)
 	}
 
-	svc := fail2ban.NewService(cfg.ConfigRoot, cfg.RunRoot, cfg.LogRoot)
-
-	supervisor := health.New(svc, cfg.HealthInterval, cfg.HealthAutoReload, cfg.HealthAutoRestart, cfg.HealthMaxRetries)
-	server := api.New(cfg.Secret, cfg.ConfigRoot, svc, supervisor)
+	svc := fail2ban.NewService(cfg.ConfigRoot, cfg.LogRoot)
+	supervisor := health.New(svc, health.Policy{
+		Interval:    cfg.HealthInterval,
+		MaxRetries:  cfg.HealthMaxRetries,
+		AutoReload:  cfg.HealthAutoReload,
+		AutoRestart: cfg.HealthAutoRestart,
+	})
+	poller := callback.NewPoller(cfg, svc, nil)
+	server := api.New(cfg, svc, supervisor, poller)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	go supervisor.Start(ctx)
-	callback.StartPoller(ctx, cfg, svc, nil)
+	go poller.Run(ctx)
 
 	if err := server.ListenAndServe(ctx, config.Addr(cfg), cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
 		log.Fatalf("server error: %v", err)

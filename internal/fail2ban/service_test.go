@@ -18,184 +18,528 @@ package fail2ban
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"testing/fstest"
+	"time"
 )
 
-func TestCleanupLegacyUICustomAction(t *testing.T) {
+// Installs fake tools as the only PATH entry, so the host's real fail2ban and service managers are never reached.
+func fakeTools(t *testing.T, scripts map[string]string) {
+	t.Helper()
+	bin := t.TempDir()
+	for name, body := range scripts {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\n"+body), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin)
+}
+
+// A fake fail2ban-client that only answers when called with -c <root>.
+func fakeClient(root, cases string) string {
+	return `[ "$1" = "-c" ] && [ "$2" = "` + root + `" ] || { echo "missing -c root" >&2; exit 64; }
+shift 2
+case "$1" in
+` + cases + `
+*) exit 1 ;;
+esac
+`
+}
+
+func TestPingRequiresPong(t *testing.T) {
+	cases := []struct {
+		name    string
+		reply   string
+		wantErr bool
+	}{
+		{"pong", `ping) echo "Server replied: pong" ;;`, false},
+		{"unexpected reply", `ping) echo "Server replied: busy" ;;`, true},
+		{"command fails", `ping) echo "Failed to access socket path" ; exit 255 ;;`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			fakeTools(t, map[string]string{"fail2ban-client": fakeClient(root, tc.reply)})
+			if err := NewService(root, "/var/log").Ping(context.Background()); (err != nil) != tc.wantErr {
+				t.Fatalf("Ping() = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestReloadReturnsCommandOutput(t *testing.T) {
 	root := t.TempDir()
-	jailLocal := filepath.Join(root, "jail.local")
-	content := "[DEFAULT]\n# managed by fail2ban-ui-agent\naction = ui-custom-action\nbanaction = iptables-multiport\n"
-	if err := os.WriteFile(jailLocal, []byte(content), 0644); err != nil {
-		t.Fatal(err)
+	fakeTools(t, map[string]string{"fail2ban-client": fakeClient(root, `reload) echo "reload-ok" ;;`)})
+	out, err := NewService(root, "/var/log").Reload(context.Background())
+	if err != nil || !strings.Contains(out, "reload-ok") {
+		t.Fatalf("Reload() = %q, %v", out, err)
 	}
-	s := NewService(root, "/var/run/fail2ban", "/var/log")
-	if err := s.CleanupLegacyUICustomAction(); err != nil {
-		t.Fatal(err)
+}
+
+func TestRestartMode(t *testing.T) {
+	cases := []struct {
+		name        string
+		managers    map[string]string
+		reloadFails bool
+		wantMode    string
+		wantErr     bool
+	}{
+		{"systemctl restarts", map[string]string{"systemctl": "exit 0\n"}, false, "restart", false},
+		{"falls through to service", map[string]string{"systemctl": "exit 1\n", "service": "exit 0\n"}, false, "restart", false},
+		{"no service manager reloads", map[string]string{}, false, "reload", false},
+		{"failed restart reloads", map[string]string{"rc-service": "exit 1\n"}, false, "reload", false},
+		{"everything fails", map[string]string{"systemctl": "exit 1\n"}, true, "reload", true},
 	}
-	raw, err := os.ReadFile(jailLocal)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			reload := `reload) echo OK ;;`
+			if tc.reloadFails {
+				reload = `reload) exit 255 ;;`
+			}
+			tools := map[string]string{"fail2ban-client": fakeClient(root, reload)}
+			for k, v := range tc.managers {
+				tools[k] = v
+			}
+			fakeTools(t, tools)
+			mode, err := NewService(root, "/var/log").Restart(context.Background())
+			if mode != tc.wantMode || (err != nil) != tc.wantErr {
+				t.Fatalf("Restart() = %q, %v; want %q, err=%v", mode, err, tc.wantMode, tc.wantErr)
+			}
+			if err != nil && strings.Contains(err.Error(), "rc-service") {
+				t.Fatalf("service managers that are not installed must not be tried: %v", err)
+			}
+		})
+	}
+}
+
+func TestRestartTimeoutDoesNotTryNextManager(t *testing.T) {
+	root := t.TempDir()
+	marker := filepath.Join(root, "second-restart")
+	sleepBin, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("sleep not available")
+	}
+	fakeTools(t, map[string]string{
+		"fail2ban-client": fakeClient(root, `reload) echo OK ;;`),
+		"systemctl":       "exec " + sleepBin + " 5\n",
+		"service":         ": > " + marker + "\n",
+	})
+	defer func(d time.Duration) { restartTimeout = d }(restartTimeout)
+	restartTimeout = 300 * time.Millisecond
+	if _, err := NewService(root, "/var/log").Restart(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Restart() err = %v, want deadline exceeded", err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("a second service manager was started while the first restart was still running")
+	}
+}
+
+func TestValidate(t *testing.T) {
+	cases := []struct {
+		name        string
+		client      string
+		wantInvalid bool
+		wantErr     bool
+		wantOutput  string
+	}{
+		{"valid", `echo "OK: configuration test is successful"`, false, false, "OK: configuration test"},
+		{"invalid", `echo "ERROR: No section: 'Definition'"; exit 255`, true, true, "No section"},
+		{"not installed", "", false, true, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			tools := map[string]string{}
+			if tc.client != "" {
+				tools["fail2ban-client"] = `[ "$1 $2 $3" = "-c ` + root + ` -t" ] || exit 64
+` + tc.client + "\n"
+			}
+			fakeTools(t, tools)
+			out, err := NewService(root, "/var/log").Validate(context.Background())
+			if (err != nil) != tc.wantErr || errors.Is(err, ErrConfigInvalid) != tc.wantInvalid {
+				t.Fatalf("Validate() err = %v, want err=%v invalid=%v", err, tc.wantErr, tc.wantInvalid)
+			}
+			if !strings.Contains(out, tc.wantOutput) {
+				t.Fatalf("output = %q, want %q", out, tc.wantOutput)
+			}
+		})
+	}
+}
+
+func TestCapOutput(t *testing.T) {
+	if got := capOutput([]byte("short"), 10); got != "short" {
+		t.Fatalf("capOutput kept %q", got)
+	}
+	got := capOutput([]byte(strings.Repeat("x", 20)), 10)
+	if !strings.HasPrefix(got, strings.Repeat("x", 10)+"\n") || strings.Count(got, "x") != 10 {
+		t.Fatalf("capOutput = %q", got)
+	}
+}
+
+func TestStoppedByAdmin(t *testing.T) {
+	cases := []struct {
+		name  string
+		tools map[string]string
+		want  bool
+	}{
+		{"inactive", map[string]string{"systemctl": `[ "$1 $2" = "show fail2ban" ] && printf 'LoadState=loaded\nActiveState=inactive\n'`}, true},
+		{"failed", map[string]string{"systemctl": `printf 'LoadState=loaded\nActiveState=failed\n'`}, false},
+		{"active", map[string]string{"systemctl": `printf 'LoadState=loaded\nActiveState=active\n'`}, false},
+		{"unit unknown", map[string]string{"systemctl": `printf 'LoadState=not-found\nActiveState=inactive\n'`}, false},
+		{"no systemd", map[string]string{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeTools(t, tc.tools)
+			if got := NewService(t.TempDir(), "/var/log").StoppedByAdmin(context.Background()); got != tc.want {
+				t.Fatalf("StoppedByAdmin() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Lists the directory fail2ban-regex was pointed at, so tests can see which includes were staged.
+const listFilterDir = `for f in "${2%/*}"/*; do echo "staged:${f##*/}"; done
+exit ${F2B_EXIT:-0}
+`
+
+func TestTestFilterStagesIncludes(t *testing.T) {
+	root := t.TempDir()
+	fd := filepath.Join(root, "filter.d")
+	files := map[string]string{
+		"common.conf":  "[INCLUDES]\nafter = extra.conf\n[DEFAULT]\n_daemon = \\S*\n",
+		"common.local": "[DEFAULT]\n_daemon = sshd\n",
+		"extra.conf":   "[DEFAULT]\n",
+		"d1.conf":      "[INCLUDES]\nbefore = d2.conf\n",
+		"d2.conf":      "[INCLUDES]\nbefore = d3.conf\n",
+		"d3.conf":      "[INCLUDES]\nbefore = d4.conf\n",
+		"d4.conf":      "[DEFAULT]\n",
+		"sshd.conf":    "[Definition]\nfailregex = old\n",
+	}
+	for name, content := range files {
+		writeConfigFile(t, fd, name, content)
+	}
+	writeConfigFile(t, root, "escape.conf", "[DEFAULT]\n")
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	fakeTools(t, map[string]string{"fail2ban-regex": listFilterDir})
+
+	content := "[INCLUDES]\nbefore = common.conf ../escape.conf ../../etc/passwd\n         d1.conf\nafter = sshd.conf evil.sh\n[Definition]\nfailregex = ^<HOST>$\n"
+	out, path, code, err := NewService(root, "/var/log").TestFilter(context.Background(), "sshd", []string{"1.2.3.4"}, content)
+	if err != nil || code != 0 {
+		t.Fatalf("TestFilter() = code %d, err %v", code, err)
+	}
+	if filepath.Base(path) != testFilterFile {
+		t.Fatalf("filterPath = %s", path)
+	}
+	for _, want := range []string{"common.conf", "common.local", "extra.conf", "d1.conf", "d2.conf", "d3.conf", testFilterFile, "test.log"} {
+		if !strings.Contains(out, "staged:"+want+"\n") {
+			t.Errorf("%s not staged:\n%s", want, out)
+		}
+	}
+	for _, unwanted := range []string{"d4.conf", "passwd", "evil.sh", "sshd.conf", "escape.conf"} {
+		if strings.Contains(out, "staged:"+unwanted+"\n") {
+			t.Errorf("%s must not be staged:\n%s", unwanted, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "escape.conf")); err == nil {
+		t.Error("an include name escaped the staging directory")
+	}
+}
+
+func TestTestFilterExitCodes(t *testing.T) {
+	root := t.TempDir()
+	writeConfigFile(t, filepath.Join(root, "filter.d"), "sshd.conf", "[Definition]\nfailregex = x\n")
+	s := NewService(root, "/var/log")
+
+	fakeTools(t, map[string]string{"fail2ban-regex": "echo 'ERROR: No failure-id group'; exit 255\n"})
+	out, path, code, err := s.TestFilter(context.Background(), "sshd", []string{"line"}, "")
+	if err != nil || code != 255 || !strings.Contains(out, "failure-id") || path != filepath.Join(root, "filter.d", "sshd.conf") {
+		t.Fatalf("normal non-zero exit: out=%q path=%s code=%d err=%v", out, path, code, err)
+	}
+
+	fakeTools(t, map[string]string{})
+	if _, _, _, err := s.TestFilter(context.Background(), "sshd", []string{"line"}, ""); err == nil {
+		t.Fatal("missing fail2ban-regex must be an error")
+	}
+	if _, _, _, err := s.TestFilter(context.Background(), "nope", nil, ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown filter: %v", err)
+	}
+}
+
+func TestParseFilterIncludes(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    []string
+	}{
+		{"none", "[Definition]\nfailregex = x\n", nil},
+		{"before and after", "[INCLUDES]\nbefore = common.conf\nafter = extra.local\n", []string{"common.conf", "extra.local"}},
+		{"several per line and continuation", "[INCLUDES]\nbefore = a.conf b.conf\n    c.conf\n", []string{"a.conf", "b.conf", "c.conf"}},
+		{"case-insensitive section", "[includes]\nBefore = a.conf\n", []string{"a.conf"}},
+		{"only inside INCLUDES", "[Definition]\nbefore = x.conf\n[INCLUDES]\nafter = y.conf\n[Init]\nafter = z.conf\n", []string{"y.conf"}},
+		{"comments and other keys ignored", "[INCLUDES]\n# before = no.conf\nfoo = bar.conf\n  cont.conf\nbefore = yes.conf\n", []string{"yes.conf"}},
+		{"CRLF", "[INCLUDES]\r\nbefore = common.conf\r\n", []string{"common.conf"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseFilterIncludes(tc.content); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("parseFilterIncludes = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFilterNamesFromEntries(t *testing.T) {
+	fsys := fstest.MapFS{
+		"sshd.conf":            {},
+		"sshd.local":           {},
+		"nginx-http-auth.conf": {},
+		"_custom.local":        {},
+		".sshd.local.swp":      {},
+		".hidden.conf":         {},
+		".f2bui-123":           {},
+		"README":               {},
+		"bad name.conf":        {},
+		"a.b.conf":             {},
+		"sshd.local.f2bui.bak": {},
+		"ignorecommands/x":     {},
+	}
+	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := string(raw)
-	if strings.Contains(got, "ui-custom-action") {
-		t.Fatalf("legacy action still present: %s", got)
+	want := []string{"_custom", "nginx-http-auth", "sshd"}
+	if got := filterNamesFromEntries(entries); !reflect.DeepEqual(got, want) {
+		t.Fatalf("filterNamesFromEntries = %v, want %v", got, want)
 	}
-	if !strings.Contains(got, "managed by fail2ban-ui-agent") {
-		t.Fatalf("managed marker missing: %s", got)
+}
+
+func TestGetFiltersMissingDirIsEmpty(t *testing.T) {
+	got, err := NewService(t.TempDir(), "/var/log").GetFilters()
+	if err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("GetFilters() = %#v, %v", got, err)
+	}
+}
+
+func TestEnsureSectionHeader(t *testing.T) {
+	cases := []struct {
+		name, content, want string
+	}{
+		{"empty", "", "[sshd]\n"},
+		{"whitespace only", "  \n", "[sshd]\n"},
+		{"missing header", "enabled = true\n", "[sshd]\nenabled = true\n"},
+		{"header present", "[sshd]\nenabled = true\n", "[sshd]\nenabled = true\n"},
+		{"header after DEFAULT", "[DEFAULT]\nx = 1\n [sshd] \n", "[DEFAULT]\nx = 1\n [sshd] \n"},
+		{"other section only", "[nginx]\nenabled = true\n", "[sshd]\n[nginx]\nenabled = true\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ensureSectionHeader("sshd", tc.content); got != tc.want {
+				t.Fatalf("ensureSectionHeader = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCreateJailAddsSectionHeader(t *testing.T) {
+	root := t.TempDir()
+	if err := NewService(root, "/var/log").CreateJail("myjail", "enabled = true\n"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "jail.d", "myjail.local"))
+	if err != nil || string(raw) != "[myjail]\nenabled = true\n" {
+		t.Fatalf("jail file = %q, %v", raw, err)
+	}
+}
+
+func TestIsManagedJailLocal(t *testing.T) {
+	cases := []struct {
+		content string
+		want    bool
+	}{
+		{"[DEFAULT]\n# managed by fail2ban-ui-agent\n", true},
+		{"[DEFAULT]\naction_mwlg = %(action_)s\n  ui-custom-action[logpath=x]\n", true},
+		{"[DEFAULT]\nbantime = 1h\n", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := isManagedJailLocal(tc.content); got != tc.want {
+			t.Errorf("isManagedJailLocal(%q) = %v, want %v", tc.content, got, tc.want)
+		}
+	}
+}
+
+func TestEnsureJailLocalStructure(t *testing.T) {
+	legacy := "[DEFAULT]\nenabled = true\n# Custom Fail2Ban action for UI callbacks\naction_mwlg = %(action_)s\n             ui-custom-action[logpath=\"%(logpath)s\", chain=\"%(chain)s\"]\n# Custom Fail2Ban action applied by fail2ban-ui\naction = %(action_mwlg)s\n"
+	cases := []struct {
+		name       string
+		existing   *string
+		content    string
+		wantReason string
+		check      func(t *testing.T, got string)
+	}{
+		{name: "creates missing file", content: "[DEFAULT]\nbantime = 1h\n", check: func(t *testing.T, got string) {
+			if !strings.Contains(got, "bantime = 1h") || !strings.Contains(got, agentManagedMarker) {
+				t.Fatalf("content = %q", got)
+			}
+		}},
+		{name: "rewrites a legacy UI file", existing: &legacy, content: legacy, check: func(t *testing.T, got string) {
+			if strings.Contains(got, "ui-custom-action") || strings.Contains(got, "action_mwlg") || !strings.Contains(got, "enabled = true") {
+				t.Fatalf("legacy action block survived: %q", got)
+			}
+		}},
+		{name: "never touches a user file", existing: ptr("[DEFAULT]\nbantime = 1d\n"), content: "[DEFAULT]\n", wantReason: "unmanaged", check: func(t *testing.T, got string) {
+			if got != "[DEFAULT]\nbantime = 1d\n" {
+				t.Fatalf("user file modified: %q", got)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			p := filepath.Join(root, "jail.local")
+			if tc.existing != nil {
+				if err := os.WriteFile(p, []byte(*tc.existing), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reason, err := NewService(root, "/var/log").EnsureJailLocalStructure(tc.content)
+			if err != nil || reason != tc.wantReason {
+				t.Fatalf("EnsureJailLocalStructure = %q, %v", reason, err)
+			}
+			raw, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.check(t, string(raw))
+		})
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
+
+func TestRemapLogRoot(t *testing.T) {
+	cases := []struct {
+		p, logRoot, want string
+	}{
+		{"/var/log/auth.log", "/remotelogs", "/remotelogs/auth.log"},
+		{"/var/log/httpd/*.log", "/remotelogs", "/remotelogs/httpd/*.log"},
+		{"/var/log", "/remotelogs", "/remotelogs"},
+		{"/var/logfoo/x.log", "/remotelogs", "/var/logfoo/x.log"},
+		{"/opt/app/app.log", "/remotelogs", "/opt/app/app.log"},
+		{"/var/log/auth.log", "/var/log", "/var/log/auth.log"},
+		{"/var/log/auth.log", "", "/var/log/auth.log"},
+	}
+	for _, tc := range cases {
+		if got := remapLogRoot(tc.p, tc.logRoot); got != tc.want {
+			t.Errorf("remapLogRoot(%q, %q) = %q, want %q", tc.p, tc.logRoot, got, tc.want)
+		}
 	}
 }
 
 func TestTestLogpathWithResolutionVariable(t *testing.T) {
 	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "paths-common.conf.d"), 0755); err != nil {
-		t.Fatal(err)
-	}
 	if err := os.WriteFile(filepath.Join(root, "paths-common.conf"), []byte("apache_error_log = /var/log/httpd/error_log\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	logRoot := t.TempDir()
 	target := filepath.Join(logRoot, "httpd", "error_log")
-	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(target, []byte("x"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	s := NewService(root, "/var/run/fail2ban", logRoot)
-	orig, resolved, files, err := s.TestLogpathWithResolution("%(apache_error_log)s")
+	writeConfigFile(t, filepath.Dir(target), "error_log", "x")
+	orig, resolved, files, err := NewService(root, logRoot).TestLogpathWithResolution("%(apache_error_log)s")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if orig != "%(apache_error_log)s" {
-		t.Fatalf("orig=%q", orig)
-	}
-	if !strings.HasPrefix(resolved, logRoot) {
-		t.Fatalf("resolved not mapped to logRoot: %q", resolved)
+	if orig != "%(apache_error_log)s" || resolved != target {
+		t.Fatalf("orig=%q resolved=%q", orig, resolved)
 	}
 	if len(files) != 1 || files[0] != target {
 		t.Fatalf("files=%v target=%s", files, target)
 	}
 }
 
-func TestTestLogpathDirectoryReturnsFiles(t *testing.T) {
-	root := t.TempDir()
-	dir := filepath.Join(root, "etc")
-	if err := os.MkdirAll(filepath.Join(dir, "subdir"), 0755); err != nil {
+func TestTestLogpathErrors(t *testing.T) {
+	locked := filepath.Join(t.TempDir(), "locked")
+	writeConfigFile(t, locked, "app.log", "x")
+	if err := os.Chmod(locked, 0); err != nil {
 		t.Fatal(err)
 	}
-	a := filepath.Join(dir, "a.conf")
-	b := filepath.Join(dir, "b.log")
-	if err := os.WriteFile(a, []byte("a"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(b, []byte("b"), 0644); err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0755) })
 
-	s := NewService(root, "/var/run/fail2ban", "/var/log")
-	got, err := s.TestLogpath(dir)
-	if err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name    string
+		logpath string
+		want    error
+	}{
+		{"relative", "var/log/auth.log", ErrLogpathInvalid},
+		{"traversal", "/var/log/../../etc/shadow", ErrLogpathInvalid},
+		{"shell characters", "/var/log/$(id).log", ErrLogpathInvalid},
+		{"unresolved variable", "%(no_such_var)s", ErrLogpathUnresolved},
+		{"file in unreadable dir", filepath.Join(locked, "app.log"), ErrLogpathInaccessible},
+		{"unreadable dir", locked, ErrLogpathInaccessible},
+		{"glob in unreadable dir", filepath.Join(locked, "*.log"), ErrLogpathInaccessible},
 	}
-	want := []string{a, b}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got=%v want=%v", got, want)
+	s := NewService(t.TempDir(), "/var/log")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.want == ErrLogpathInaccessible && os.Geteuid() == 0 {
+				t.Skip("root bypasses directory permissions")
+			}
+			if _, _, _, err := s.TestLogpathWithResolution(tc.logpath); !errors.Is(err, tc.want) {
+				t.Fatalf("TestLogpathWithResolution(%q) = %v, want %v", tc.logpath, err, tc.want)
+			}
+		})
 	}
 }
 
-func TestEnsureJailLocalStructureWithContentStripsUIAction(t *testing.T) {
-	root := t.TempDir()
-	s := NewService(root, "/var/run/fail2ban", "/var/log")
-	content := `[DEFAULT]
-enabled = true
-# Custom Fail2Ban action for UI callbacks
-action_mwlg = %(action_)s
-             ui-custom-action[logpath="%(logpath)s", chain="%(chain)s"]
-# Custom Fail2Ban action applied by fail2ban-ui
-action = %(action_mwlg)s
-`
-	if err := s.EnsureJailLocalStructureWithContent(content); err != nil {
+func TestTestLogpathDirectoryReturnsFiles(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "etc")
+	writeConfigFile(t, dir, "a.conf", "a")
+	writeConfigFile(t, dir, "b.log", "b")
+	if err := os.MkdirAll(filepath.Join(dir, "subdir"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(filepath.Join(root, "jail.local"))
+	got, err := NewService(t.TempDir(), "/var/log").TestLogpath(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := string(raw)
-	if strings.Contains(got, "ui-custom-action") || strings.Contains(got, "action_mwlg") {
-		t.Fatalf("unexpected legacy action block: %s", got)
-	}
-	if !strings.Contains(got, "enabled = true") {
-		t.Fatalf("expected defaults content in jail.local: %s", got)
+	want := []string{filepath.Join(dir, "a.conf"), filepath.Join(dir, "b.log")}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got=%v want=%v", got, want)
 	}
 }
 
 func TestDeleteFilterRemovesLocalAndConf(t *testing.T) {
 	root := t.TempDir()
 	filterDir := filepath.Join(root, "filter.d")
-	if err := os.MkdirAll(filterDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	localPath := filepath.Join(filterDir, "apache.local")
-	confPath := filepath.Join(filterDir, "apache.conf")
-	if err := os.WriteFile(localPath, []byte(""), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(confPath, []byte(""), 0644); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"apache.local", "apache.conf", "apache.local.f2bui.bak", "apache.conf.f2bui.bak"} {
+		writeConfigFile(t, filterDir, name, "")
 	}
 
-	s := NewService(root, "/var/run/fail2ban", "/var/log")
-	if err := s.DeleteFilter("apache"); err != nil {
+	if err := NewService(root, "/var/log").DeleteFilter("apache"); err != nil {
 		t.Fatalf("DeleteFilter failed: %v", err)
 	}
-	if _, err := os.Stat(localPath); !os.IsNotExist(err) {
-		t.Fatalf("expected %s to be removed", localPath)
-	}
-	if _, err := os.Stat(confPath); !os.IsNotExist(err) {
-		t.Fatalf("expected %s to be removed", confPath)
-	}
-}
-
-func TestDeleteFilterReturnsNotFound(t *testing.T) {
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "filter.d"), 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	s := NewService(root, "/var/run/fail2ban", "/var/log")
-	err := s.DeleteFilter("missing")
-	if err == nil {
-		t.Fatal("expected not found error")
-	}
-	if !strings.Contains(err.Error(), "does not exist") {
-		t.Fatalf("unexpected error: %v", err)
+	for _, name := range []string{"apache.local", "apache.conf", "apache.local.f2bui.bak", "apache.conf.f2bui.bak"} {
+		if _, err := os.Stat(filepath.Join(filterDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be removed", name)
+		}
 	}
 }
 
-func TestReloadWithOutputReturnsCommandOutput(t *testing.T) {
-	root := t.TempDir()
-	binDir := filepath.Join(root, "bin")
-	if err := os.MkdirAll(binDir, 0755); err != nil {
-		t.Fatal(err)
+func TestDeleteReturnsNotFound(t *testing.T) {
+	s := NewService(t.TempDir(), "/var/log")
+	if err := s.DeleteFilter("missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DeleteFilter: %v", err)
 	}
-	scriptPath := filepath.Join(binDir, "fail2ban-client")
-	script := "#!/usr/bin/env sh\nif [ \"$1\" = \"reload\" ]; then\n  echo \"reload-ok\"\n  exit 0\nfi\nexit 1\n"
-	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
-
-	s := NewService(root, "/var/run/fail2ban", "/var/log")
-	out, err := s.ReloadWithOutput(context.Background())
-	if err != nil {
-		t.Fatalf("ReloadWithOutput failed: %v", err)
-	}
-	if !strings.Contains(out, "reload-ok") {
-		t.Fatalf("expected reload output, got: %q", out)
+	if err := s.DeleteJail("missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DeleteJail: %v", err)
 	}
 }

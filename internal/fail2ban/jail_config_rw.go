@@ -22,46 +22,20 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/swissmakers/fail2ban-ui-agent/internal/fsutil"
 )
 
 func jailDDir(configRoot string) string {
 	return filepath.Join(configRoot, "jail.d")
 }
 
-// ensureJailLocalFile guarantees jail.d/{name}.local exists: use existing .local, else copy from .conf, else create minimal.
-func ensureJailLocalFile(jailName, configRoot string) error {
-	jailName = strings.TrimSpace(jailName)
-	if jailName == "" {
-		return fmt.Errorf("jail name cannot be empty")
-	}
-	jailDPath := jailDDir(configRoot)
-	localPath := filepath.Join(jailDPath, jailName+".local")
-	confPath := filepath.Join(jailDPath, jailName+".conf")
-
-	if _, err := os.Stat(localPath); err == nil {
-		return nil
-	}
-	if _, err := os.Stat(confPath); err == nil {
-		content, err := os.ReadFile(confPath)
-		if err != nil {
-			return fmt.Errorf("read jail .conf %s: %w", confPath, err)
-		}
-		if err := os.MkdirAll(jailDPath, 0755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(localPath, content, 0644); err != nil {
-			return fmt.Errorf("write jail .local %s: %w", localPath, err)
-		}
-		return nil
-	}
-	if err := os.MkdirAll(jailDPath, 0755); err != nil {
+func writeJailLocal(configRoot, jailName, content string) error {
+	dir := jailDDir(configRoot)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	minimal := fmt.Sprintf("[%s]\n", jailName)
-	if err := os.WriteFile(localPath, []byte(minimal), 0644); err != nil {
-		return fmt.Errorf("create jail .local %s: %w", localPath, err)
-	}
-	return nil
+	return fsutil.WriteConfig(filepath.Join(dir, jailName+".local"), []byte(content), 0644)
 }
 
 // readJailConfigWithFallback reads jail.d/{name}.local, else .conf, else returns a minimal section (path = intended .local).

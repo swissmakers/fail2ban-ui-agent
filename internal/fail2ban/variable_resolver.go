@@ -111,6 +111,9 @@ func searchVariableInFile(filePath, varName string) (string, error) {
 						}
 						return strings.TrimSpace(currentValue.String()), nil
 					}
+					if err := scanner.Err(); err != nil {
+						return "", err
+					}
 					return strings.TrimSpace(currentValue.String()), nil
 				}
 			}
@@ -139,8 +142,14 @@ func searchVariableInFile(filePath, varName string) (string, error) {
 				pendingLineOriginal = nextLineOriginal
 				continue
 			}
+			if err := scanner.Err(); err != nil {
+				return "", err
+			}
 			return strings.TrimSpace(currentValue.String()), nil
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
 	}
 
 	if inMultiLine && currentVar != "" {
@@ -152,7 +161,7 @@ func searchVariableInFile(filePath, varName string) (string, error) {
 func findVariableDefinition(varName, fail2banPath string) (string, error) {
 	fail2banPath = normalizeConfigRoot(fail2banPath)
 	if _, err := os.Stat(fail2banPath); os.IsNotExist(err) {
-		return "", fmt.Errorf("variable '%s' not found: /etc/fail2ban directory does not exist", varName)
+		return "", fmt.Errorf("variable '%s' not found: %s does not exist", varName, fail2banPath)
 	}
 
 	var foundValue string
@@ -233,9 +242,7 @@ func resolveVariableRecursive(varName string, visited map[string]bool, fail2banP
 			if err != nil {
 				return "", fmt.Errorf("failed to resolve variable '%s' in '%s': %w", nestedVar, varName, err)
 			}
-			pattern := fmt.Sprintf("%%\\(%s\\)s", regexp.QuoteMeta(nestedVar))
-			re := regexp.MustCompile(pattern)
-			resolved = re.ReplaceAllString(resolved, nestedValue)
+			resolved = strings.ReplaceAll(resolved, "%("+nestedVar+")s", nestedValue)
 		}
 		iteration++
 	}
@@ -264,9 +271,7 @@ func ResolveLogpathVariables(logpath, fail2banPath string) (string, error) {
 			if err != nil {
 				return "", fmt.Errorf("failed to resolve variable '%s': %w", varName, err)
 			}
-			pattern := fmt.Sprintf("%%\\(%s\\)s", regexp.QuoteMeta(varName))
-			re := regexp.MustCompile(pattern)
-			resolved = re.ReplaceAllString(resolved, varValue)
+			resolved = strings.ReplaceAll(resolved, "%("+varName+")s", varValue)
 		}
 		iteration++
 	}

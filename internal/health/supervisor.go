@@ -18,47 +18,58 @@ package health
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/swissmakers/fail2ban-ui-agent/internal/model"
 )
 
+const (
+	maxRemediationAttempts = 5
+	maxRemediationBackoff  = 30 * time.Minute
+	remediationTimeout     = 60 * time.Second
+	stoppedByAdminNote     = "skipped: stopped by administrator"
+
+	actionNone    = ""
+	actionReload  = "reload"
+	actionRestart = "restart"
+)
+
 type Fail2banOps interface {
 	Ping(ctx context.Context) error
-	Reload(ctx context.Context) error
-	Restart(ctx context.Context) error
+	Reload(ctx context.Context) (string, error)
+	Restart(ctx context.Context) (string, error)
+	StoppedByAdmin(ctx context.Context) bool
+	Environment() model.Environment
+}
+
+type Policy struct {
+	Interval    time.Duration
+	MaxRetries  int
+	AutoReload  bool
+	AutoRestart bool
 }
 
 type Supervisor struct {
-	ops         Fail2banOps
-	interval    time.Duration
-	autoReload  bool
-	autoRestart bool
-	maxRetries  int
+	ops    Fail2banOps
+	policy Policy
+	now    func() time.Time
 
 	mu    sync.RWMutex
 	state model.HealthState
 }
 
-func New(ops Fail2banOps, interval time.Duration, autoReload, autoRestart bool, maxRetries int) *Supervisor {
-	if maxRetries < 1 {
-		maxRetries = 1
+// The zero state is not ready: nothing counts as healthy before the first successful check.
+func New(ops Fail2banOps, p Policy) *Supervisor {
+	if p.MaxRetries < 1 {
+		p.MaxRetries = 1
 	}
-	return &Supervisor{
-		ops:         ops,
-		interval:    interval,
-		autoReload:  autoReload,
-		autoRestart: autoRestart,
-		maxRetries:  maxRetries,
-		state: model.HealthState{
-			Healthy: true,
-		},
-	}
+	return &Supervisor{ops: ops, policy: p, now: func() time.Time { return time.Now().UTC() }}
 }
 
 func (s *Supervisor) Start(ctx context.Context) {
-	t := time.NewTicker(s.interval)
+	t := time.NewTicker(s.policy.Interval)
 	defer t.Stop()
 	s.check(ctx)
 	for {
@@ -77,40 +88,102 @@ func (s *Supervisor) State() model.HealthState {
 	return s.state
 }
 
+func (s *Supervisor) Interval() time.Duration { return s.policy.Interval }
+
+// Probes run outside the lock so State() never waits on fail2ban-client.
 func (s *Supervisor) check(ctx context.Context) {
-	checkTime := time.Now().UTC()
-	err := s.ops.Ping(ctx)
+	pingErr := s.ops.Ping(ctx)
+	env := s.ops.Environment()
+	stopped := pingErr != nil && s.ops.StoppedByAdmin(ctx)
+	now := s.now()
+
+	s.mu.Lock()
+	st := &s.state
+	st.LastCheck = now
+	st.Env = env
+	st.StoppedByAdmin = stopped
+	if pingErr == nil {
+		st.PingOK = true
+		st.LastSuccess = now
+		st.LastError = ""
+		st.ConsecutiveFails = 0
+		st.RemediationAttempts = 0
+		st.RemediationSuspended = false
+		s.mu.Unlock()
+		return
+	}
+	st.PingOK = false
+	st.LastError = pingErr.Error()
+	st.ConsecutiveFails++
+	if stopped && st.ConsecutiveFails >= s.policy.MaxRetries {
+		st.LastRemediation = stoppedByAdminNote
+	}
+	action := planRemediation(*st, now, s.policy)
+	s.mu.Unlock()
+
+	if action != actionNone {
+		s.remediate(ctx, action)
+	}
+}
+
+func (s *Supervisor) remediate(ctx context.Context, action string) {
+	ctx, cancel := context.WithTimeout(ctx, remediationTimeout)
+	defer cancel()
+	result := action
+	var err error
+	if action == actionReload {
+		_, err = s.ops.Reload(ctx)
+	} else {
+		var mode string
+		if mode, err = s.ops.Restart(ctx); mode != "" {
+			result = mode
+		}
+	}
+	if err != nil {
+		result = fmt.Sprintf("%s failed: %v", result, err)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.state.LastCheck = checkTime
-	if err == nil {
-		s.state.Healthy = true
-		s.state.LastError = ""
-		s.state.ConsecutiveFails = 0
-		s.state.LastSuccess = checkTime
-		return
-	}
+	s.state.RemediationAttempts++
+	s.state.LastRemediationAt = s.now()
+	s.state.LastRemediation = result
+	s.state.RemediationSuspended = s.state.RemediationAttempts >= maxRemediationAttempts
+}
 
-	s.state.Healthy = false
-	s.state.LastError = err.Error()
-	s.state.ConsecutiveFails++
-	if s.state.ConsecutiveFails < s.maxRetries {
-		return
+// Reload first, restart on later attempts, with exponential backoff; nothing while stopped by an admin or suspended.
+func planRemediation(st model.HealthState, now time.Time, p Policy) string {
+	if st.PingOK || st.ConsecutiveFails < p.MaxRetries || st.StoppedByAdmin ||
+		st.RemediationSuspended || st.RemediationAttempts >= maxRemediationAttempts {
+		return actionNone
 	}
+	if st.RemediationAttempts > 0 && now.Before(st.LastRemediationAt.Add(remediationBackoff(p.Interval, st.RemediationAttempts))) {
+		return actionNone
+	}
+	switch {
+	case p.AutoReload && (st.RemediationAttempts == 0 || !p.AutoRestart):
+		return actionReload
+	case p.AutoRestart:
+		return actionRestart
+	}
+	return actionNone
+}
 
-	if s.autoReload {
-		if rErr := s.ops.Reload(ctx); rErr == nil {
-			s.state.LastRemediation = "reload"
-			s.state.ConsecutiveFails = 0
-			return
-		}
+func remediationBackoff(interval time.Duration, attempts int) time.Duration {
+	if d := interval << attempts; d > 0 && d < maxRemediationBackoff {
+		return d
 	}
-	if s.autoRestart {
-		if rsErr := s.ops.Restart(ctx); rsErr == nil {
-			s.state.LastRemediation = "restart"
-			s.state.ConsecutiveFails = 0
-			return
-		}
+	return maxRemediationBackoff
+}
+
+// Ready is true only for a fresh check (< 3 intervals old) that saw pong and all host prerequisites.
+func Ready(st model.HealthState, now time.Time, interval time.Duration) (bool, model.ReadyChecks) {
+	c := model.ReadyChecks{
+		Ping:           st.PingOK,
+		ConfigWritable: st.Env.ConfigWritable,
+		Fail2banClient: st.Env.Fail2banClient,
+		Fail2banRegex:  st.Env.Fail2banRegex,
+		Fresh:          !st.LastCheck.IsZero() && now.Sub(st.LastCheck) < 3*interval,
 	}
+	return c.Ping && c.ConfigWritable && c.Fail2banClient && c.Fail2banRegex && c.Fresh, c
 }
