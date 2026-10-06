@@ -10,7 +10,23 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: linux_amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Format, vet and test
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./cmd/... ./internal/...
+          go test -count=1 ./cmd/... ./internal/...
+
   build:
+    needs: test
     runs-on: linux_amd64
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +51,16 @@ jobs:
           DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           echo "$DH_TOKEN" | podman login docker.io --username "$DH_USER" --password-stdin
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=$(sed -n 's/^const Version = "\(.*\)"$/\1/p' internal/version/version.go)
+          if [ -z "$VERSION" ]; then
+            echo "Failed to parse version from internal/version/version.go" >&2
+            exit 1
+          fi
+          echo "version=v$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build multi-arch manifest
         env:
@@ -62,6 +88,7 @@ jobs:
         run: |
           DEST="docker://$REG/$PROJ/fail2ban-ui-agent"
           podman manifest push --all "$LOCAL_MANIFEST" "$DEST:${{ github.sha }}"
+          podman manifest push --all "$LOCAL_MANIFEST" "$DEST:${{ steps.version.outputs.version }}"
           podman manifest push --all "$LOCAL_MANIFEST" "$DEST:latest"
 
       - name: Push to Docker Hub
@@ -73,4 +100,5 @@ jobs:
         run: |
           DEST="docker://docker.io/$DH_NS/$DH_REPO"
           podman manifest push --all "$LOCAL_MANIFEST" "$DEST:${{ github.sha }}"
+          podman manifest push --all "$LOCAL_MANIFEST" "$DEST:${{ steps.version.outputs.version }}"
           podman manifest push --all "$LOCAL_MANIFEST" "$DEST:latest"
