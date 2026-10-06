@@ -1,8 +1,8 @@
 Name:           fail2ban-ui-agent
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Fail2ban UI Agent
-License:        GPL-3.0-only
+License:        AGPL-3.0-only
 URL:            https://github.com/swissmakers/fail2ban-ui
 Source0:        %{name}-%{version}.tar.gz
 
@@ -39,5 +39,9 @@ install -D -m 0644 packaging/systemd/fail2ban-ui-agent.service %{buildroot}%{_un
 %{_unitdir}/fail2ban-ui-agent.service
 
 %changelog
+* Wed Sep 30 2026 Swissmakers <support@swissmakers.ch> - 0.2.0-1
+- Health endpoints, supervised remediation with backoff, reliable callback queue
+- Refuse weak AGENT_SECRET values AGENT_FAIL2BAN_RUN_DIR removed
+
 * Sun Apr 05 2026 Swissmakers <support@swissmakers.ch> - 0.1.0-1
 - Initial RPM skeleton

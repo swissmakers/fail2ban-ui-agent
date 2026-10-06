@@ -31,7 +31,7 @@ This document describes the **packaging skeleton** for **fail2ban-ui-agent**: a 
 | Environment defaults | `/etc/default/fail2ban-ui-agent` (optional) | Overrides and secrets; referenced by the unit via `EnvironmentFile=-` |
 | RPM spec | `packaging/rpm/fail2ban-ui-agent.spec` | Builds `%{_bindir}/fail2ban-ui-agent` and installs the systemd unit |
 
-The agent listens on a TCP port (default in the shipped unit: **9443**; override with `AGENT_PORT` in `/etc/default/fail2ban-ui-agent` if you standardize on **9700** for Fail2ban-UI compatibility).
+The agent listens on TCP port **9700** (the Fail2ban-UI default for agents); override it with `AGENT_PORT` in `/etc/default/fail2ban-ui-agent`.
 
 
 ## 2. Prerequisites
@@ -39,7 +39,7 @@ The agent listens on a TCP port (default in the shipped unit: **9443**; override
 * A Linux host with **systemd** and **fail2ban** installed and enabled.
 * **Root** (or equivalent) to install unit files under `/etc/systemd/system` or `/usr/lib/systemd/system` and to bind to privileged ports if required.
 * For RPM builds: **RPM build tools** (`rpm-build`, `rpmlint` optional) and a **Go toolchain** matching `BuildRequires` in the spec (currently **Go ≥ 1.25** per the spec).
-* A strong **`AGENT_SECRET`**; without it the API server refuses to start when using the standard `config.Load()` path.
+* A random **`AGENT_SECRET`** of at least 16 characters (for example `openssl rand -hex 32`); the agent refuses to start with a missing, short or placeholder secret.
 
 **IMPORTANT:** Store `AGENT_SECRET` in a root-only file (for example `/etc/default/fail2ban-ui-agent` with mode `0600`). Do not commit secrets to version control.
 
@@ -85,12 +85,11 @@ The agent listens on a TCP port (default in the shipped unit: **9443**; override
 1. Create `/etc/default/fail2ban-ui-agent` (optional but **required** for `AGENT_SECRET`):
 
    ```bash
-   sudo install -D -m 0600 /dev/stdin /etc/default/fail2ban-ui-agent <<'EOF'
-   AGENT_SECRET=change-me-to-a-long-random-value
+   sudo install -D -m 0600 /dev/stdin /etc/default/fail2ban-ui-agent <<EOF
+   AGENT_SECRET=$(openssl rand -hex 32)
    AGENT_BIND_ADDRESS=0.0.0.0
    AGENT_PORT=9700
    AGENT_FAIL2BAN_CONFIG_DIR=/etc/fail2ban
-   AGENT_FAIL2BAN_RUN_DIR=/var/run/fail2ban
    AGENT_LOG_ROOT=/var/log
    EOF
    ```
@@ -125,11 +124,13 @@ The agent listens on a TCP port (default in the shipped unit: **9443**; override
    systemctl status fail2ban-ui-agent.service
    ```
 
-2. Check the health endpoint (replace port if you changed `AGENT_PORT`):
+2. Check that the agent can manage Fail2ban:
 
    ```bash
-   curl -fsS "http://127.0.0.1:9700/healthz"
+   sudo fail2ban-ui-agent health-check --ready
    ```
+
+   The command reads `AGENT_BIND_ADDRESS` and `AGENT_PORT` from the environment; pass `--url http://127.0.0.1:<port>` when you run it outside the service environment.
 
 3. Review logs on failure:
 
@@ -155,9 +156,9 @@ The spec file `packaging/rpm/fail2ban-ui-agent.spec` is a **minimal skeleton**. 
 
 **Procedure**
 
-1. From a clean export of the agent sources at version `0.1.0`, create an archive named so the unpacked directory is `fail2ban-ui-agent-0.1.0` (example naming; align with `Version:` in the spec).
+1. From a clean export of the agent sources at version `0.2.0` (see `internal/version/version.go`), create an archive named so the unpacked directory is `fail2ban-ui-agent-0.2.0` (align with `Version:` in the spec).
 
-2. Place the tarball where `rpmbuild` expects it, for example `~/rpmbuild/SOURCES/fail2ban-ui-agent-0.1.0.tar.gz`.
+2. Place the tarball where `rpmbuild` expects it, for example `~/rpmbuild/SOURCES/fail2ban-ui-agent-0.2.0.tar.gz`.
 
 ### 4.3. Build the RPM
 
@@ -183,8 +184,8 @@ Before publishing packages, review and typically change:
 
 | Topic | Action |
 |-------|--------|
-| **License** | Ensure `License:` matches the actual license of the shipped sources (and `%license` file list). |
-| **Version / Release** | Align with your release policy; use `Release:` for rebuilds. |
+| **License** | The sources are AGPL-3.0-only; keep `License:` and the `%license` file list in sync if that changes. |
+| **Version / Release** | Keep `Version:` equal to `internal/version/version.go`; use `Release:` for rebuilds. |
 | **Source0 / URL** | Point to signed tarballs or a Git forge archive; add `Source1` for vendor tarballs if you bundle Go modules offline. |
 | **`BuildRequires`** | Match the Go version available in your buildroots (RHEL 9 AppStream, EPEL, module streams, etc.). |
 | **`%build`** | Add `CGO_ENABLED=0` and explicit `GOOS`/`GOARCH` if you need a static binary for musl-free glibc targets. |
