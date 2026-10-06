@@ -9,7 +9,8 @@ services:
       - NET_RAW
     network_mode: host
     environment:
-      - AGENT_SECRET=agent-secret-change-me
+      # At least 16 characters, e.g. from: openssl rand -hex 32
+      - AGENT_SECRET=${AGENT_SECRET:?set AGENT_SECRET}
       - AGENT_BIND_ADDRESS=0.0.0.0
       #- AGENT_PORT=9700
       - TZ=Europe/Zurich
