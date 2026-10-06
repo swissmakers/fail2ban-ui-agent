@@ -1,7 +1,7 @@
 # Fail2ban container with integrated fail2ban-ui-agent
 # Can be build from this directory by: docker build -t localhost/fail2ban-ui-agent:dev .
 
-FROM golang:1.25.12 AS builder
+FROM golang:1.27.1 AS builder
 ARG TARGETARCH=amd64
 WORKDIR /src
 COPY go.mod ./

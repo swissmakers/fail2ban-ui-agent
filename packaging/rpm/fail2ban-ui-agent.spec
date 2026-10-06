@@ -6,7 +6,7 @@ License:        AGPL-3.0-only
 URL:            https://github.com/swissmakers/fail2ban-ui
 Source0:        %{name}-%{version}.tar.gz
 
-BuildRequires:  golang >= 1.25
+BuildRequires:  golang >= 1.27
 Requires:       fail2ban
 
 %description
