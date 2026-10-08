@@ -67,6 +67,7 @@ The agent pings Fail2ban every `AGENT_HEALTH_INTERVAL` so that protection resume
 2. If Fail2ban still does not answer, later attempts restart it through `systemctl`, `service` or `rc-service` (`AGENT_HEALTH_AUTO_RESTART`). Without a service manager, the agent falls back to a reload.
 3. The wait between attempts doubles each time (up to 30 minutes). After 5 attempts the agent stops remediating until a ping succeeds again, so a broken configuration cannot cause a restart loop.
 4. When systemd reports `fail2ban` as `inactive`, an administrator stopped it on purpose. The agent then does not restart it.
+5. During a known service operation or unresolved interrupted command, probes and remediation are deferred. The authenticated health endpoint reports `busy: true`; this does not mean the agent transport is offline.
 
 
 ## 3. HTTP API
@@ -108,13 +109,31 @@ All of the following require **`X-F2B-Token`**.
 
 **Fail2ban service actions**
 
+New clients submit durable operations and poll their status. The request returns promptly, disconnecting the browser, HTTP caller, or UI process does not cancel the worker.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/v1/operations/capabilities` | Protocol version, supported operation kinds, and configuration snapshot support |
+| `POST` | `/v1/operations` | Body: `id`, `kind` (`reload`, `restart`, `validate`, `ban`, or `unban`), plus `jail` and `ip` for ban/unban. Returns `202` and the operation record. Reusing an ID for the same command and target returns the original record; changing either returns `409` |
+| `GET` | `/v1/operations/{id}` | Read the durable result without querying the Fail2ban socket |
+| `POST` | `/v1/operations/{id}/reconcile` | Body: `kind`. Return an existing operation, or reserve a missing ID without dispatching a command. This prevents a delayed original request from executing after the UI starts recovery |
+| `POST` | `/v1/config/snapshots` | Body: `id`. Store an immutable rollback snapshot before editing configuration |
+| `POST` | `/v1/config/snapshots/{id}/restore` | Restore the snapshot, including removing newly created configuration files |
+| `DELETE` | `/v1/config/snapshots/{id}` | Remove a snapshot after the caller has confirmed completion or rollback |
+
+Operation states are `queued`, `running`, `succeeded`, `failed`, and `unknown`. Mutation workers have a 30-minute budget. A timeout or process interruption leaves an unknown result: the daemon may have received the command. Recovery only probes it, never repeats the command. `quiescent: true` confirms that the daemon answers again, **not** that the requested configuration was applied. The UI must verify the intended runtime state before completing its transaction or retrying. Conflicting mutations return `409 operation_busy` while a command is active or the daemon has not yet responded after interruption.
+
+Records live in `${AGENT_FAIL2BAN_CONFIG_DIR}/.fail2ban-ui-operations`, so the configuration volume must persist across container replacement. Operation records are retained for idempotency. Rollback snapshots live in `.fail2ban-ui-snapshots` and are removed explicitly after a confirmed outcome. Snapshots cover `jail.conf`, `jail.local`, the agent callback registration, and regular `.conf`/`.local` files in `jail.d`, `filter.d`, and `action.d`. They preserve content and mode, skip unchanged files, and restore ownership when permitted; insufficient `chown` privileges do not prevent configuration recovery. Snapshot creation rejects symlinks and files larger than 10 MiB or a total larger than 32 MiB.
+
+The legacy synchronous endpoints remain available and use the same durable worker:
+
 | Method | Path | Purpose |
 |--------|------|---------|
 | `POST` | `/v1/actions/reload` | Reload Fail2ban; returns `{"ok":true,"output":...}` |
 | `POST` | `/v1/actions/restart` | Restart Fail2ban; returns `{"ok":true,"mode":"restart"}`, or `"mode":"reload"` when no service manager could restart it |
 | `POST` | `/v1/actions/validate` | Test the configuration with `fail2ban-client -t`: `200 {"ok":true,"output":...}`, or `422` with `code` `config_invalid` and the test output |
 
-Reload, restart and validate run one at a time and finish even if the caller disconnects.
+Legacy callers may supply `Idempotency-Key`. Responses include `operationId`. If the HTTP wait expires before the command finishes, the endpoint returns `503 operation_pending`; callers must query the operation before retrying. An HTTP timeout never cancels the underlying worker.
 
 **Jails**
 

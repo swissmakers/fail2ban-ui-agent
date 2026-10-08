@@ -30,6 +30,22 @@ import (
 	"time"
 )
 
+func TestManagedOperationHasLongBudgetAndBlocksRemediation(t *testing.T) {
+	s := NewService(t.TempDir(), "/var/log")
+	s.SetOperationPending(true)
+	if _, err := s.Reload(context.Background()); !errors.Is(err, ErrOperationBusy) {
+		t.Fatalf("remediation admitted during operation: %v", err)
+	}
+	old := restartTimeout
+	restartTimeout = 5 * time.Millisecond
+	defer func() { restartTimeout = old }()
+	ctx, cancel := context.WithTimeout(ManagedOperationContext(context.Background()), time.Second)
+	defer cancel()
+	if _, err := runCommand(ctx, restartTimeout, "/bin/sh", "-c", "/bin/sleep 0.03"); err != nil {
+		t.Fatalf("managed command retained short timeout: %v", err)
+	}
+}
+
 // Installs fake tools as the only PATH entry, so the host's real fail2ban and service managers are never reached.
 func fakeTools(t *testing.T, scripts map[string]string) {
 	t.Helper()

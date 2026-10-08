@@ -148,7 +148,14 @@ func (p *Poller) tick(ctx context.Context) {
 	}
 
 	var dropped, rejected int
-	if infos, err := p.svc.GetJailInfos(ctx); err != nil {
+	busy := false
+	if service, ok := p.svc.(interface{ Busy() bool }); ok {
+		busy = service.Busy()
+	}
+	if busy {
+		// Keep the last observation while the command owns the daemon socket.
+		// Already queued callback deliveries can still be flushed below.
+	} else if infos, err := p.svc.GetJailInfos(ctx); err != nil {
 		tickErr = "read jails: " + err.Error()
 	} else {
 		cur := snapshotFromJailInfos(infos)

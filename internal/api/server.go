@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -35,6 +36,7 @@ import (
 	"github.com/swissmakers/fail2ban-ui-agent/internal/fail2ban"
 	"github.com/swissmakers/fail2ban-ui-agent/internal/health"
 	"github.com/swissmakers/fail2ban-ui-agent/internal/model"
+	"github.com/swissmakers/fail2ban-ui-agent/internal/operations"
 	"github.com/swissmakers/fail2ban-ui-agent/internal/version"
 )
 
@@ -46,15 +48,17 @@ const (
 )
 
 type Server struct {
-	cfg    config.Config
-	svc    *fail2ban.Service
-	health *health.Supervisor
-	poller *callback.Poller
-	mux    *http.ServeMux
+	cfg        config.Config
+	svc        *fail2ban.Service
+	health     *health.Supervisor
+	poller     *callback.Poller
+	mux        *http.ServeMux
+	operations *operations.Manager
 }
 
 func New(cfg config.Config, svc *fail2ban.Service, hs *health.Supervisor, poller *callback.Poller) *Server {
 	s := &Server{cfg: cfg, svc: svc, health: hs, poller: poller, mux: http.NewServeMux()}
+	s.operations = operations.New(filepath.Join(cfg.ConfigRoot, ".fail2ban-ui-operations"), operationRunner{svc: svc, health: hs})
 	s.routes()
 	return s
 }
@@ -65,6 +69,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
 
 	s.mux.HandleFunc("GET /v1/health", s.auth(s.handleHealthDetail))
+	s.mux.HandleFunc("GET /v1/operations/capabilities", s.auth(s.handleOperationCapabilities))
+	s.mux.HandleFunc("POST /v1/operations", s.auth(s.handleSubmitOperation))
+	s.mux.HandleFunc("GET /v1/operations/{id}", s.auth(s.handleGetOperation))
+	s.mux.HandleFunc("POST /v1/operations/{id}/reconcile", s.auth(s.handleReconcileOperation))
+	s.mux.HandleFunc("POST /v1/config/snapshots", s.auth(s.handleBackupConfiguration))
+	s.mux.HandleFunc("POST /v1/config/snapshots/{id}/restore", s.auth(s.handleRestoreConfiguration))
+	s.mux.HandleFunc("DELETE /v1/config/snapshots/{id}", s.auth(s.handleDeleteConfigurationBackup))
 	s.mux.HandleFunc("PUT /v1/callback/config", s.auth(s.handlePutCallbackConfig))
 	s.mux.HandleFunc("DELETE /v1/callback/config", s.auth(s.handleDeleteCallbackConfig))
 	s.mux.HandleFunc("POST /v1/actions/reload", s.auth(s.handleActionReload))
@@ -83,8 +94,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /v1/jails/{name}", s.auth(s.handleDeleteJail))
 	s.mux.HandleFunc("GET /v1/jails/{name}/config", s.auth(s.handleGetJailConfig))
 	s.mux.HandleFunc("PUT /v1/jails/{name}/config", s.auth(s.handlePutJailConfig))
-	s.mux.HandleFunc("POST /v1/jails/{name}/ban", s.auth(s.handleJailIP(s.svc.BanIP)))
-	s.mux.HandleFunc("POST /v1/jails/{name}/unban", s.auth(s.handleJailIP(s.svc.UnbanIP)))
+	s.mux.HandleFunc("POST /v1/jails/{name}/ban", s.auth(s.handleJailIP("ban")))
+	s.mux.HandleFunc("POST /v1/jails/{name}/unban", s.auth(s.handleJailIP("unban")))
 
 	s.mux.HandleFunc("GET /v1/filters", s.auth(s.handleListFilters))
 	s.mux.HandleFunc("POST /v1/filters", s.auth(s.handleCreateFilter))
@@ -95,6 +106,7 @@ func (s *Server) routes() {
 }
 
 func (s *Server) ListenAndServe(ctx context.Context, addr, tlsCertFile, tlsKeyFile string) error {
+	defer s.operations.Close()
 	server := &http.Server{
 		Addr:              addr,
 		Handler:           s.mux,
@@ -156,13 +168,17 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		// Bound the request body for every authenticated (body-carrying) route.
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		if operationMutation(r) {
+			release, err := s.operations.AcquireMutation()
+			if err != nil {
+				writeOperationError(w, err)
+				return
+			}
+			defer release()
+			r = r.WithContext(fail2ban.ManagedOperationContext(r.Context()))
+		}
 		next(w, r)
 	}
-}
-
-// Detached from the client connection: a dropped UI request must not kill fail2ban mid-restart.
-func actionContext(r *http.Request) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(r.Context()), actionTimeout)
 }
 
 func (s *Server) readiness() (model.HealthState, bool, model.ReadyChecks) {
@@ -192,6 +208,7 @@ type healthDetail struct {
 	Fail2ban   fail2banInfo      `json:"fail2ban"`
 	Supervisor model.HealthState `json:"supervisor"`
 	Callback   callbackInfo      `json:"callback"`
+	Busy       bool              `json:"busy"`
 }
 
 type agentInfo struct {
@@ -223,12 +240,17 @@ func (s *Server) handleHealthDetail(w http.ResponseWriter, r *http.Request) {
 		Fail2ban:   s.fail2banInfo(r.Context(), st.PingOK),
 		Supervisor: st,
 		Callback:   s.callbackInfo(),
+		Busy:       s.operations.Busy() || s.svc.Busy(),
 	})
 }
 
 // Queried live, but only when the last ping answered, so a hung daemon can not stall the endpoint.
 func (s *Server) fail2banInfo(ctx context.Context, pingOK bool) fail2banInfo {
 	info := fail2banInfo{Jails: []string{}}
+	if s.operations.Busy() || s.svc.Busy() {
+		info.Error = "service operation is active; live daemon queries are deferred"
+		return info
+	}
 	if !pingOK {
 		info.Error = "skipped: fail2ban did not answer the last ping"
 		return info
@@ -272,39 +294,15 @@ func (s *Server) callbackInfo() callbackInfo {
 }
 
 func (s *Server) handleActionReload(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := actionContext(r)
-	defer cancel()
-	output, err := s.svc.Reload(ctx)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error(), "output": output})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "output": output})
+	s.handleLegacyOperation(w, r, "reload")
 }
 
 func (s *Server) handleActionRestart(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := actionContext(r)
-	defer cancel()
-	mode, err := s.svc.Restart(ctx)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error(), "mode": mode})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": mode})
+	s.handleLegacyOperation(w, r, "restart")
 }
 
 func (s *Server) handleActionValidate(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := actionContext(r)
-	defer cancel()
-	output, err := s.svc.Validate(ctx)
-	switch {
-	case errors.Is(err, fail2ban.ErrConfigInvalid):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "code": "config_invalid", "error": err.Error(), "output": output})
-	case err != nil:
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error(), "output": output})
-	default:
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "output": output})
-	}
+	s.handleLegacyOperation(w, r, "validate")
 }
 
 func (s *Server) handlePutCallbackConfig(w http.ResponseWriter, r *http.Request) {
@@ -489,7 +487,7 @@ func (s *Server) handlePutJailConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (s *Server) handleJailIP(action func(ctx context.Context, jail, ip string) error) http.HandlerFunc {
+func (s *Server) handleJailIP(kind string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			IP string `json:"ip"`
@@ -497,11 +495,15 @@ func (s *Server) handleJailIP(action func(ctx context.Context, jail, ip string) 
 		if !decodeJSON(w, r, &req) {
 			return
 		}
-		if err := action(r.Context(), r.PathValue("name"), req.IP); err != nil {
+		if err := fail2ban.ValidateJailName(r.PathValue("name")); err != nil {
 			writeError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		if err := fail2ban.ValidateIP(req.IP); err != nil {
+			writeError(w, err)
+			return
+		}
+		s.handleLegacyOperation(w, r, kind, strings.TrimSpace(r.PathValue("name")), strings.TrimSpace(req.IP))
 	}
 }
 

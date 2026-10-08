@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -62,8 +63,23 @@ type Service struct {
 	configRoot string
 	logRoot    string
 	// Serializes reload/restart/validate between the API and the supervisor; a channel so waiting honours ctx.
-	svcLock chan struct{}
+	svcLock          chan struct{}
+	operationPending atomic.Bool
+	serviceRunning   atomic.Bool
 }
+
+type operationContextKey struct{}
+
+// ManagedOperationContext permits only the durable worker to enter the service
+// gate while an operation is reserved, and selects its longer command budget.
+func ManagedOperationContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, operationContextKey{}, true)
+}
+
+func (s *Service) SetOperationPending(busy bool) { s.operationPending.Store(busy) }
+func (s *Service) Busy() bool                    { return s.operationPending.Load() || s.serviceRunning.Load() }
+
+var ErrOperationBusy = errors.New("service operation is running or awaiting reconciliation")
 
 func NewService(configRoot, logRoot string) *Service {
 	return &Service{
@@ -74,15 +90,24 @@ func NewService(configRoot, logRoot string) *Service {
 }
 
 func (s *Service) lockService(ctx context.Context) error {
+	managed, _ := ctx.Value(operationContextKey{}).(bool)
+	if s.operationPending.Load() && !managed {
+		return ErrOperationBusy
+	}
 	select {
 	case s.svcLock <- struct{}{}:
+		if s.operationPending.Load() && !managed {
+			<-s.svcLock
+			return ErrOperationBusy
+		}
+		s.serviceRunning.Store(true)
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("waiting for another reload/restart/validate: %w", ctx.Err())
 	}
 }
 
-func (s *Service) unlockService() { <-s.svcLock }
+func (s *Service) unlockService() { s.serviceRunning.Store(false); <-s.svcLock }
 
 // Ping succeeds only when the server actually answered "pong".
 func (s *Service) Ping(ctx context.Context) error {
@@ -234,7 +259,11 @@ func (s *Service) BanIP(ctx context.Context, jail, ip string) error {
 	if err := ValidateIP(ip); err != nil {
 		return err
 	}
-	_, err := s.client(ctx, shortCommandTimeout, "set", strings.TrimSpace(jail), "banip", strings.TrimSpace(ip))
+	if err := s.lockService(ctx); err != nil {
+		return err
+	}
+	defer s.unlockService()
+	_, err := s.client(ctx, mutationCommandTimeout(ctx), "set", strings.TrimSpace(jail), "banip", strings.TrimSpace(ip))
 	return err
 }
 
@@ -245,7 +274,11 @@ func (s *Service) UnbanIP(ctx context.Context, jail, ip string) error {
 	if err := ValidateIP(ip); err != nil {
 		return err
 	}
-	_, err := s.client(ctx, shortCommandTimeout, "set", strings.TrimSpace(jail), "unbanip", strings.TrimSpace(ip))
+	if err := s.lockService(ctx); err != nil {
+		return err
+	}
+	defer s.unlockService()
+	_, err := s.client(ctx, mutationCommandTimeout(ctx), "set", strings.TrimSpace(jail), "unbanip", strings.TrimSpace(ip))
 	return err
 }
 
@@ -255,6 +288,13 @@ func (s *Service) Reload(ctx context.Context) (string, error) {
 	}
 	defer s.unlockService()
 	return s.client(ctx, longCommandTimeout, "reload")
+}
+
+func mutationCommandTimeout(ctx context.Context) time.Duration {
+	if managed, _ := ctx.Value(operationContextKey{}).(bool); managed {
+		return 30 * time.Minute
+	}
+	return shortCommandTimeout
 }
 
 // Restart returns "restart" when a service manager restarted fail2ban, or "reload" when it fell back to a reload.
@@ -737,9 +777,18 @@ func (s *Service) client(ctx context.Context, timeout time.Duration, args ...str
 }
 
 func runCommand(ctx context.Context, timeout time.Duration, name string, args ...string) (string, error) {
+	if managed, _ := ctx.Value(operationContextKey{}).(bool); managed {
+		// The worker owns a bounded lifetime independent of HTTP. Short read
+		// probes retain their normal timeout; service changes may take minutes.
+		if timeout == longCommandTimeout || timeout == restartTimeout {
+			timeout = 30 * time.Minute
+		}
+	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = time.Second
+	out, err := cmd.CombinedOutput()
 	if ctxErr := ctx.Err(); err != nil && ctxErr != nil {
 		return "", fmt.Errorf("%s %s did not finish: %w", name, strings.Join(args, " "), ctxErr)
 	}

@@ -34,6 +34,76 @@ type fakeOps struct {
 	restartEntered chan struct{}
 	reloads        atomic.Int32
 	restarts       atomic.Int32
+	busy           atomic.Bool
+	busyObserved   chan struct{}
+}
+
+func (f *fakeOps) Busy() bool {
+	busy := f.busy.Load()
+	if busy && f.busyObserved != nil {
+		select {
+		case f.busyObserved <- struct{}{}:
+		default:
+		}
+	}
+	return busy
+}
+
+func TestSupervisorDefersWhileKnownOperationRunsAndResumes(t *testing.T) {
+	ops := &fakeOps{pingErr: errors.New("socket busy")}
+	ops.busy.Store(true)
+	s := New(ops, Policy{Interval: time.Second, MaxRetries: 1, AutoReload: true})
+	for i := 0; i < 5; i++ {
+		s.check(context.Background())
+	}
+	if ops.reloads.Load() != 0 || s.State().ConsecutiveFails != 0 {
+		t.Fatal("busy operation caused remediation or counted as failure")
+	}
+	ops.busy.Store(false)
+	s.check(context.Background())
+	if ops.reloads.Load() != 1 {
+		t.Fatal("supervision did not resume after operation")
+	}
+}
+
+func TestSupervisorWakeRefreshesBeforeNextScheduledTick(t *testing.T) {
+	ops := &fakeOps{busyObserved: make(chan struct{}, 1)}
+	ops.busy.Store(true)
+	s := New(ops, Policy{Interval: time.Hour, MaxRetries: 1, AutoReload: true, AutoRestart: true})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Start(ctx)
+	select {
+	case <-ops.busyObserved:
+	case <-time.After(time.Second):
+		t.Fatal("supervisor did not observe busy state")
+	}
+	// The next scheduled tick is an hour away; release must refresh current
+	// daemon evidence promptly without scheduling any service mutation.
+	ops.busy.Store(false)
+	s.Wake()
+	deadline := time.Now().Add(time.Second)
+	for s.State().LastSuccess.IsZero() {
+		if time.Now().After(deadline) {
+			t.Fatal("gate release did not refresh health promptly")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if ops.reloads.Load() != 0 || ops.restarts.Load() != 0 {
+		t.Fatal("health wake caused a service mutation")
+	}
+}
+
+func TestSupervisorWakeProbeNeverRemediates(t *testing.T) {
+	ops := &fakeOps{pingErr: errors.New("daemon unavailable")}
+	s := New(ops, Policy{Interval: time.Hour, MaxRetries: 1, AutoReload: true, AutoRestart: true})
+	s.checkWithRemediation(context.Background(), false)
+	if ops.reloads.Load() != 0 || ops.restarts.Load() != 0 {
+		t.Fatal("read-only wake scheduled remediation")
+	}
+	if s.State().LastCheck.IsZero() {
+		t.Fatal("read-only wake did not record probe evidence")
+	}
 }
 
 var allPresent = model.Environment{ConfigWritable: true, Fail2banClient: true, Fail2banRegex: true}

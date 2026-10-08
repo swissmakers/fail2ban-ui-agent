@@ -76,7 +76,9 @@ func newHarness(t *testing.T) *harness {
 	cfg := config.Config{Secret: testSecret, ConfigRoot: root, LogRoot: "/var/log", CallbackPollInterval: 4 * time.Second}
 	svc := fail2ban.NewService(root, "/var/log")
 	hs := health.New(svc, health.Policy{Interval: time.Hour, MaxRetries: 1})
-	return &harness{s: New(cfg, svc, hs, callback.NewPoller(cfg, svc, log.New(io.Discard, "", 0))), root: root, hs: hs}
+	s := New(cfg, svc, hs, callback.NewPoller(cfg, svc, log.New(io.Discard, "", 0)))
+	t.Cleanup(s.operations.Close)
+	return &harness{s: s, root: root, hs: hs}
 }
 
 func (h *harness) do(method, path, body string, authed bool) *httptest.ResponseRecorder {
@@ -183,7 +185,7 @@ func TestRouting(t *testing.T) {
 		{"DELETE", "/v1/jails/missing", "", true, 404, "code"},
 		{"GET", "/v1/jails/sshd/config", "", true, 200, "filePath"},
 		{"POST", "/v1/jails/sshd/ban", `{"ip":"nope"}`, true, 400, "code"},
-		{"POST", "/v1/jails/sshd/unban", `{"ip":"192.0.2.1"}`, true, 500, "error"},
+		{"POST", "/v1/jails/sshd/unban", `{"ip":"192.0.2.1"}`, true, 503, "error"},
 		{"GET", "/v1/filters", "", true, 200, "filters"},
 		{"GET", "/v1/filters/test", "", true, 404, "code"},
 		{"POST", "/v1/filters/test", `{}`, true, 400, "code"},
@@ -346,7 +348,12 @@ func TestActionEndpoints(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fakeTools(t, tc.tools)
 			rr := newHarness(t).do(http.MethodPost, tc.path, "", true)
-			if got := decode(t, rr); rr.Code != tc.wantStatus || !reflect.DeepEqual(got, tc.want) {
+			got := decode(t, rr)
+			if id, ok := got["operationId"].(string); !ok || id == "" {
+				t.Fatalf("legacy action omitted operation ID: %v", got)
+			}
+			delete(got, "operationId")
+			if rr.Code != tc.wantStatus || !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("%s = %d %v, want %d %v", tc.path, rr.Code, got, tc.wantStatus, tc.want)
 			}
 		})

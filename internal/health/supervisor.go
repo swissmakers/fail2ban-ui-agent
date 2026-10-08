@@ -58,6 +58,7 @@ type Supervisor struct {
 
 	mu    sync.RWMutex
 	state model.HealthState
+	wake  chan struct{}
 }
 
 // The zero state is not ready: nothing counts as healthy before the first successful check.
@@ -65,7 +66,16 @@ func New(ops Fail2banOps, p Policy) *Supervisor {
 	if p.MaxRetries < 1 {
 		p.MaxRetries = 1
 	}
-	return &Supervisor{ops: ops, policy: p, now: func() time.Time { return time.Now().UTC() }}
+	return &Supervisor{ops: ops, policy: p, wake: make(chan struct{}, 1), now: func() time.Time { return time.Now().UTC() }}
+}
+
+// Wake refreshes daemon health promptly after a long command releases its
+// gate. Coalescing avoids a backlog of probes after closely spaced writes.
+func (s *Supervisor) Wake() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
 }
 
 func (s *Supervisor) Start(ctx context.Context) {
@@ -78,6 +88,8 @@ func (s *Supervisor) Start(ctx context.Context) {
 			return
 		case <-t.C:
 			s.check(ctx)
+		case <-s.wake:
+			s.checkWithRemediation(ctx, false)
 		}
 	}
 }
@@ -92,7 +104,19 @@ func (s *Supervisor) Interval() time.Duration { return s.policy.Interval }
 
 // Probes run outside the lock so State() never waits on fail2ban-client.
 func (s *Supervisor) check(ctx context.Context) {
+	s.checkWithRemediation(ctx, true)
+}
+
+func (s *Supervisor) checkWithRemediation(ctx context.Context, allowRemediation bool) {
+	// Ping uses the same daemon socket as reload. A known operation may keep
+	// that socket occupied without any loss of transport or daemon health.
+	if busy, ok := s.ops.(interface{ Busy() bool }); ok && busy.Busy() {
+		return
+	}
 	pingErr := s.ops.Ping(ctx)
+	if busy, ok := s.ops.(interface{ Busy() bool }); ok && busy.Busy() {
+		return
+	}
 	env := s.ops.Environment()
 	stopped := pingErr != nil && s.ops.StoppedByAdmin(ctx)
 	now := s.now()
@@ -121,12 +145,15 @@ func (s *Supervisor) check(ctx context.Context) {
 	action := planRemediation(*st, now, s.policy)
 	s.mu.Unlock()
 
-	if action != actionNone {
+	if action != actionNone && allowRemediation {
 		s.remediate(ctx, action)
 	}
 }
 
 func (s *Supervisor) remediate(ctx context.Context, action string) {
+	if busy, ok := s.ops.(interface{ Busy() bool }); ok && busy.Busy() {
+		return
+	}
 	ctx, cancel := context.WithTimeout(ctx, remediationTimeout)
 	defer cancel()
 	result := action
