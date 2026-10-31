@@ -93,7 +93,7 @@ func TestSnapshotFromJailInfos(t *testing.T) {
 
 func TestEventID(t *testing.T) {
 	seen := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
-	// Pinned: changing the derivation breaks deduplication of events queued across an agent upgrade.
+	// changing the derivation breaks deduplication of events queued across an agent upgrade.
 	if got := eventID("srv-1", "ban", "sshd", "203.0.113.7", seen); got != "3cf453a0a2aabe31957d9a99a5f8e2ba" {
 		t.Fatalf("eventID = %s", got)
 	}
@@ -376,5 +376,47 @@ func TestPollerPurgesEventsOfAnotherServer(t *testing.T) {
 	h.tick(4 * time.Second)
 	if st := h.p.Stats(); len(h.ui.snapshot()) != 1 || st.Pending != 0 {
 		t.Fatalf("srv-1 events must be purged after switching to srv-2: posts=%d %+v", len(h.ui.snapshot()), st)
+	}
+}
+
+type fakeLogReader struct {
+	fakeReader
+	calls int
+}
+
+func (f *fakeLogReader) BanLogLines(_ context.Context, jail string, ips []string) map[string]string {
+	f.calls++
+	out := map[string]string{}
+	for _, ip := range ips {
+		out[ip] = jail + ": failed password from " + ip
+	}
+	return out
+}
+
+func TestPollerSendsBanLogLinesOnceAndRetriesThem(t *testing.T) {
+	h := newPollerHarness(t, http.StatusServiceUnavailable)
+	reader := &fakeLogReader{}
+	h.p.svc = reader
+	reader.set("sshd")
+	h.tick(0)
+	reader.set("sshd", "203.0.113.7")
+	h.tick(4 * time.Second)
+	h.tick(4 * time.Second)
+	reader.set("sshd")
+	h.tick(4 * time.Second)
+
+	posts := h.ui.snapshot()
+	if len(posts) != 3 {
+		t.Fatalf("posts = %d, want ban, retried ban and unban", len(posts))
+	}
+	want := "sshd: failed password from 203.0.113.7"
+	if posts[0].body["logs"] != want || posts[1].body["logs"] != want {
+		t.Fatalf("ban and its retry must carry the same log lines: %q / %q", posts[0].body["logs"], posts[1].body["logs"])
+	}
+	if posts[2].path != "/api/unban" || posts[2].body["logs"] != "" {
+		t.Fatalf("unban must not carry log lines: %+v", posts[2])
+	}
+	if reader.calls != 1 {
+		t.Fatalf("log lines must be read once per observed ban, read %d times", reader.calls)
 	}
 }

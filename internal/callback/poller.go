@@ -45,18 +45,23 @@ const (
 	maxPostBackoff  = 5 * time.Minute
 )
 
-// JailReader fetches current jail / banned-IP state (fail2ban-client).
+// Fetches current jail / banned-IP state (fail2ban-client).
 type JailReader interface {
 	GetJailInfos(ctx context.Context) ([]model.JailInfo, error)
 }
 
+// Optional: readers that can look up the log lines behind new bans, so the UI can show them.
+type banLogReader interface {
+	BanLogLines(ctx context.Context, jail string, ips []string) map[string]string
+}
+
 type event struct {
-	id string
-	// "ban" or "unban"
+	id        string
 	kind      string
 	jail, ip  string
 	serverID  string
 	firstSeen time.Time
+	logs      string
 }
 
 type Stats struct {
@@ -68,17 +73,15 @@ type Stats struct {
 	Rejected   int       `json:"rejected"`
 }
 
-// Poller periodically diffs banned IPs and POSTs /api/ban and /api/unban to Fail2ban-UI.
+// Periodically diffs banned IPs and POSTs /api/ban and /api/unban to Fail2ban-UI.
 type Poller struct {
-	configRoot string
-	env        config.CallbackRuntimeConfig
-	interval   time.Duration
-	svc        JailReader
-	httpClient *http.Client
-	log        *log.Logger
-	now        func() time.Time
-
-	// Owned by the Run goroutine.
+	configRoot  string
+	env         config.CallbackRuntimeConfig
+	interval    time.Duration
+	svc         JailReader
+	httpClient  *http.Client
+	log         *log.Logger
+	now         func() time.Time
 	prev        map[string]map[string]struct{}
 	queue       []event
 	active      config.CallbackRuntimeConfig
@@ -89,7 +92,7 @@ type Poller struct {
 	stats Stats
 }
 
-// NewPoller builds a poller. A cfg.CallbackPollInterval of 0 disables it; URL and secret are resolved on every tick.
+// cfg.CallbackPollInterval of 0 disables it -> URL and secret are resolved on every tick.
 func NewPoller(cfg config.Config, svc JailReader, logger *log.Logger) *Poller {
 	if logger == nil {
 		logger = log.Default()
@@ -99,7 +102,6 @@ func NewPoller(cfg config.Config, svc JailReader, logger *log.Logger) *Poller {
 		env:        cfg.EnvCallback,
 		interval:   cfg.CallbackPollInterval,
 		svc:        svc,
-		// Redirects are not followed: they would carry X-Callback-Secret to another location.
 		httpClient: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		log:        logger,
 		now:        func() time.Time { return time.Now().UTC() },
@@ -160,8 +162,10 @@ func (p *Poller) tick(ctx context.Context) {
 	} else {
 		cur := snapshotFromJailInfos(infos)
 		if p.prev != nil {
+			events := newEvents(rt.ServerID, cur, p.prev, now)
+			p.attachBanLogs(ctx, events)
 			var n int
-			p.queue, n = enqueue(p.queue, newEvents(rt.ServerID, cur, p.prev, now), maxQueuedEvents)
+			p.queue, n = enqueue(p.queue, events, maxQueuedEvents)
 			dropped += n
 		}
 		p.prev = cur
@@ -226,10 +230,37 @@ func (p *Poller) updateStats(now time.Time, tickErr string, dropped, rejected in
 	}
 }
 
+// Reads each jail's logs once for all of its new bans.
+func (p *Poller) attachBanLogs(ctx context.Context, events []event) {
+	reader, ok := p.svc.(banLogReader)
+	if !ok {
+		return
+	}
+	byJail := map[string][]int{}
+	for i, e := range events {
+		if e.kind == "ban" {
+			byJail[e.jail] = append(byJail[e.jail], i)
+		}
+	}
+	for jail, idx := range byJail {
+		ips := make([]string, len(idx))
+		for k, i := range idx {
+			ips[k] = events[i].ip
+		}
+		logs := reader.BanLogLines(ctx, jail, ips)
+		for _, i := range idx {
+			events[i].logs = logs[events[i].ip]
+		}
+	}
+}
+
 func (p *Poller) post(ctx context.Context, rt config.CallbackRuntimeConfig, e event) (int, error) {
 	body := map[string]string{"ip": e.ip, "jail": e.jail, "serverId": e.serverID}
 	if hn := callbackHostname(rt); hn != "" {
 		body["hostname"] = hn
+	}
+	if e.logs != "" {
+		body["logs"] = e.logs
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {

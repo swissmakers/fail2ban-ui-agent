@@ -50,7 +50,7 @@ The agent does **not** replace Fail2ban; it requires a working **fail2ban** daem
 Fail2ban-UI records bans and unbans that happen on the host. For agent-managed hosts, the agent reports them:
 
 1. Fail2ban-UI pushes its callback URL, callback secret and server ID with **`PUT /v1/callback/config`**. The agent stores them in `${AGENT_FAIL2BAN_CONFIG_DIR}/fail2ban-ui-agent.id` (mode `0600`).
-2. A **poller** compares the banned IPs of every jail each `AGENT_CALLBACK_POLL_INTERVAL` and POSTs each change to Fail2ban-UI’s **`/api/ban`** or **`/api/unban`**, authenticated with **`X-Callback-Secret`**.
+2. A **poller** compares the banned IPs of every jail each `AGENT_CALLBACK_POLL_INTERVAL` and POSTs each change to Fail2ban-UI’s **`/api/ban`** or **`/api/unban`**, authenticated with **`X-Callback-Secret`**. Ban events include up to 200 of the newest log lines that mention the IP, read from the jail's monitored log files (or the systemd journal of the last day, if available), so Fail2ban-UI can show them under **Logs**.
 3. Each change gets a stable **`X-Callback-Event-ID`**. When Fail2ban-UI is unreachable, the agent keeps up to 1000 events for one hour and retries them in order with exponential backoff (up to 5 minutes). Fail2ban-UI discards duplicates by event ID, so a retry never records a ban twice.
 4. The agent compares only jails that exist in both snapshots. A reload that briefly removes a jail does not flood Fail2ban-UI with unbans.
 5. When a server is removed from Fail2ban-UI, it calls **`DELETE /v1/callback/config?serverId=<id>`**. The agent deletes the store only if it still belongs to that server.
