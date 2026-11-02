@@ -261,6 +261,8 @@ func (p *Poller) post(ctx context.Context, rt config.CallbackRuntimeConfig, e ev
 	}
 	if e.logs != "" {
 		body["logs"] = e.logs
+		// Fail2ban does not expose the failure count of a ban, so the matched log lines stand in for it.
+		body["failures"] = strconv.Itoa(strings.Count(e.logs, "\n") + 1)
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {

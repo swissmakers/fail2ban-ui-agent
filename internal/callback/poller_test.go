@@ -388,7 +388,7 @@ func (f *fakeLogReader) BanLogLines(_ context.Context, jail string, ips []string
 	f.calls++
 	out := map[string]string{}
 	for _, ip := range ips {
-		out[ip] = jail + ": failed password from " + ip
+		out[ip] = jail + ": failed password from " + ip + "\n" + jail + ": invalid user from " + ip
 	}
 	return out
 }
@@ -409,12 +409,15 @@ func TestPollerSendsBanLogLinesOnceAndRetriesThem(t *testing.T) {
 	if len(posts) != 3 {
 		t.Fatalf("posts = %d, want ban, retried ban and unban", len(posts))
 	}
-	want := "sshd: failed password from 203.0.113.7"
+	want := "sshd: failed password from 203.0.113.7\nsshd: invalid user from 203.0.113.7"
 	if posts[0].body["logs"] != want || posts[1].body["logs"] != want {
 		t.Fatalf("ban and its retry must carry the same log lines: %q / %q", posts[0].body["logs"], posts[1].body["logs"])
 	}
-	if posts[2].path != "/api/unban" || posts[2].body["logs"] != "" {
-		t.Fatalf("unban must not carry log lines: %+v", posts[2])
+	if posts[0].body["failures"] != "2" || posts[1].body["failures"] != "2" {
+		t.Fatalf("failures must count the matched log lines: %q / %q", posts[0].body["failures"], posts[1].body["failures"])
+	}
+	if posts[2].path != "/api/unban" || posts[2].body["logs"] != "" || posts[2].body["failures"] != "" {
+		t.Fatalf("unban must not carry log lines or failures: %+v", posts[2])
 	}
 	if reader.calls != 1 {
 		t.Fatalf("log lines must be read once per observed ban, read %d times", reader.calls)
