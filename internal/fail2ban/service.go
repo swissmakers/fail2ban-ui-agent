@@ -688,6 +688,10 @@ func (s *Service) CheckJailLocalState() (exists bool, managed bool, hasLegacyUIA
 		return false, false, false, err
 	}
 	content := string(raw)
+	// An empty jail.local, as packages and images ship it, counts as missing so the agent can manage it.
+	if strings.TrimSpace(content) == "" {
+		return false, false, false, nil
+	}
 	return true, isManagedJailLocal(content), strings.Contains(content, legacyUIActionMarker), nil
 }
 

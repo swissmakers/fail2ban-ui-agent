@@ -413,6 +413,11 @@ func TestEnsureJailLocalStructure(t *testing.T) {
 				t.Fatalf("legacy action block survived: %q", got)
 			}
 		}},
+		{name: "takes over an empty file", existing: ptr("\n"), content: "[DEFAULT]\nbantime = 1h\n", check: func(t *testing.T, got string) {
+			if !strings.Contains(got, "bantime = 1h") || !strings.Contains(got, agentManagedMarker) {
+				t.Fatalf("empty jail.local was not taken over: %q", got)
+			}
+		}},
 		{name: "never touches a user file", existing: ptr("[DEFAULT]\nbantime = 1d\n"), content: "[DEFAULT]\n", wantReason: "unmanaged", check: func(t *testing.T, got string) {
 			if got != "[DEFAULT]\nbantime = 1d\n" {
 				t.Fatalf("user file modified: %q", got)
