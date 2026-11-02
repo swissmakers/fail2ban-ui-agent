@@ -1,3 +1,3 @@
 module github.com/swissmakers/fail2ban-ui-agent
 
-go 1.27.1
+go 1.27.3
