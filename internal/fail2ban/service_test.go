@@ -99,6 +99,49 @@ func TestReloadReturnsCommandOutput(t *testing.T) {
 	}
 }
 
+// A reload that leaves a running jail without a configured action restarts that jail only.
+func TestReloadRestartsJailsThatLostAnAction(t *testing.T) {
+	for name, tc := range map[string]struct {
+		sshdActions string
+		wantRestart bool
+	}{
+		"action dropped": {sshdActions: "ui-custom-action", wantRestart: true},
+		"all loaded":     {sshdActions: "nftables-multiport, ui-custom-action"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			argv := filepath.Join(t.TempDir(), "argv")
+			fakeTools(t, map[string]string{"fail2ban-client": fakeClient(root, `-d) printf '%s\n' "['set', 'sshd', 'addaction', 'nftables-multiport']" "['set', 'sshd', 'addaction', 'ui-custom-action']" "['set', 'stopped', 'addaction', 'nftables-multiport']" ;;
+get) [ "$2" = "sshd" ] || exit 255; printf 'The jail sshd has the following actions:\n`+tc.sshdActions+`\n' ;;
+reload) echo "$*" >> `+argv+`; [ "$2" = "--restart" ] && echo "Errors in jail 'sshd'. Skipping..." || echo OK ;;`)})
+			out, err := NewService(root, "/var/log").Reload(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Contains(out, "Errors in jail 'sshd'"); got != tc.wantRestart || !strings.HasPrefix(out, "OK") {
+				t.Fatalf("Reload() output = %q, want the restart output appended: %v", out, tc.wantRestart)
+			}
+			raw, _ := os.ReadFile(argv)
+			want := "reload\n"
+			if tc.wantRestart {
+				want += "reload --restart sshd\n"
+			}
+			if string(raw) != want {
+				t.Fatalf("reload calls = %q, want %q", raw, want)
+			}
+		})
+	}
+}
+
+func TestReloadRestartRecreatesJails(t *testing.T) {
+	root := t.TempDir()
+	fakeTools(t, map[string]string{"fail2ban-client": fakeClient(root, `reload) [ "$2" = "--restart" ] && echo "restart-ok" || exit 3 ;;`)})
+	out, err := NewService(root, "/var/log").ReloadRestart(context.Background())
+	if err != nil || !strings.Contains(out, "restart-ok") {
+		t.Fatalf("ReloadRestart() = %q, %v", out, err)
+	}
+}
+
 func TestRestartMode(t *testing.T) {
 	cases := []struct {
 		name        string

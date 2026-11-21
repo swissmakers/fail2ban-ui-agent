@@ -32,6 +32,8 @@ func (r operationRunner) Run(ctx context.Context, op operations.Operation) opera
 	switch op.Kind {
 	case "reload":
 		result.Output, result.Err = r.svc.Reload(ctx)
+	case "reload-restart":
+		result.Output, result.Err = r.svc.ReloadRestart(ctx)
 	case "restart":
 		result.Mode, result.Err = r.svc.Restart(ctx)
 	case "ban":
@@ -48,7 +50,7 @@ func (r operationRunner) Run(ctx context.Context, op operations.Operation) opera
 }
 
 func (s *Server) handleOperationCapabilities(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"version": 1, "kinds": []string{"reload", "restart", "validate", "ban", "unban"}, "configurationSnapshots": true})
+	writeJSON(w, http.StatusOK, map[string]any{"version": 1, "kinds": []string{"reload", "reload-restart", "restart", "validate", "ban", "unban"}, "configurationSnapshots": true})
 }
 
 func (s *Server) handleBackupConfiguration(w http.ResponseWriter, r *http.Request) {

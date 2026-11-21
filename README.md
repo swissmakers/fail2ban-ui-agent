@@ -114,7 +114,7 @@ New clients submit durable operations and poll their status. The request returns
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET` | `/v1/operations/capabilities` | Protocol version, supported operation kinds, and configuration snapshot support |
-| `POST` | `/v1/operations` | Body: `id`, `kind` (`reload`, `restart`, `validate`, `ban`, or `unban`), plus `jail` and `ip` for ban/unban. Returns `202` and the operation record. Reusing an ID for the same command and target returns the original record; changing either returns `409` |
+| `POST` | `/v1/operations` | Body: `id`, `kind` (`reload`, `reload-restart`, `restart`, `validate`, `ban`, or `unban`), plus `jail` and `ip` for ban/unban. Returns `202` and the operation record. Reusing an ID for the same command and target returns the original record; changing either returns `409` |
 | `GET` | `/v1/operations/{id}` | Read the durable result without querying the Fail2ban socket |
 | `POST` | `/v1/operations/{id}/reconcile` | Body: `kind`. Return an existing operation, or reserve a missing ID without dispatching a command. This prevents a delayed original request from executing after the UI starts recovery |
 | `POST` | `/v1/config/snapshots` | Body: `id`. Store an immutable rollback snapshot before editing configuration |
@@ -124,6 +124,13 @@ New clients submit durable operations and poll their status. The request returns
 Operation states are `queued`, `running`, `succeeded`, `failed`, and `unknown`. Mutation workers have a 30-minute budget. A timeout or process interruption leaves an unknown result: the daemon may have received the command. Recovery only probes it, never repeats the command. `quiescent: true` confirms that the daemon answers again, **not** that the requested configuration was applied. The UI must verify the intended runtime state before completing its transaction or retrying. Conflicting mutations return `409 operation_busy` while a command is active or the daemon has not yet responded after interruption.
 
 Records live in `${AGENT_FAIL2BAN_CONFIG_DIR}/.fail2ban-ui-operations`, so the configuration volume must persist across container replacement. Operation records are retained for idempotency. Rollback snapshots live in `.fail2ban-ui-snapshots` and are removed explicitly after a confirmed outcome. Snapshots cover `jail.conf`, `jail.local`, the agent callback registration, and regular `.conf`/`.local` files in `jail.d`, `filter.d`, and `action.d`. They preserve content and mode, skip unchanged files, and restore ownership when permitted; insufficient `chown` privileges do not prevent configuration recovery. Snapshot creation rejects symlinks and files larger than 10 MiB or a total larger than 32 MiB.
+
+What the reload kinds do:
+
+- `reload` reloads the configuration. Fail2ban drops an action that a reload adds to a running jail, so the agent then compares the configured and the running actions and restarts only the jails that lost one. The output of these restarts is appended to the operation output.
+- `reload-restart` runs `fail2ban-client reload --restart`, which recreates every jail. Fail2ban-UI uses it when the ban action or chain changes.
+
+Before each `reload`, `reload-restart` and `restart`, the agent writes `action.d/nftables.local`. The `nftables` action of Fail2ban 1.1.0 runs `grep -P`, which busybox `grep` (this image) does not support and which SELinux denies on RHEL. A stopping jail then deletes the table `inet f2b-table` with the sets of all other jails: Fail2ban still lists the bans, but the firewall does not block them. The file replaces the two commands with the fixed versions from Fail2ban 1.1.1. The agent removes it once `nftables.conf` stops using `grep -P`, and never replaces an `nftables.local` that it did not write; it logs a warning instead.
 
 The legacy synchronous endpoints remain available and use the same durable worker:
 

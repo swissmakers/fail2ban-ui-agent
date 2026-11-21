@@ -39,9 +39,7 @@ type Operation struct {
 	Mode       string    `json:"mode,omitempty"`
 	Error      string    `json:"error,omitempty"`
 	Code       string    `json:"code,omitempty"`
-	// Quiescent confirms that the daemon answered a fresh probe after an
-	// interrupted command. It never claims the requested change succeeded.
-	Quiescent bool `json:"quiescent"`
+	Quiescent  bool      `json:"quiescent"`
 }
 
 type Result struct {
@@ -141,7 +139,7 @@ func (m *Manager) load() error {
 }
 
 func validKind(kind string) bool {
-	return kind == "reload" || kind == "restart" || kind == "validate" || kind == "ban" || kind == "unban"
+	return kind == "reload" || kind == "reload-restart" || kind == "restart" || kind == "validate" || kind == "ban" || kind == "unban"
 }
 
 func (m *Manager) save(op Operation) error {
@@ -301,7 +299,7 @@ func (m *Manager) run(id string) {
 	}
 	m.mu.Lock()
 	if err := m.save(op); err != nil {
-		// Keep the in-memory result honest and the gate closed after persistence failure.
+		// Keeps the in-memory result honest and the gate closed after persistence failure.
 		op.State, op.Code, op.Error, op.Quiescent = "unknown", "store_unavailable", err.Error(), false
 	}
 	m.jobs[id] = op
