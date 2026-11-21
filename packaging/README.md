@@ -156,9 +156,9 @@ The spec file `packaging/rpm/fail2ban-ui-agent.spec` is a **minimal skeleton**. 
 
 **Procedure**
 
-1. From a clean export of the agent sources at version `0.2.0` (see `internal/version/version.go`), create an archive named so the unpacked directory is `fail2ban-ui-agent-0.2.0` (align with `Version:` in the spec).
+1. From a clean export of the agent sources at version `0.3.0` (see `internal/version/version.go`), create an archive named so the unpacked directory is `fail2ban-ui-agent-0.3.0` (align with `Version:` in the spec).
 
-2. Place the tarball where `rpmbuild` expects it, for example `~/rpmbuild/SOURCES/fail2ban-ui-agent-0.2.0.tar.gz`.
+2. Place the tarball where `rpmbuild` expects it, for example `~/rpmbuild/SOURCES/fail2ban-ui-agent-0.3.0.tar.gz`.
 
 ### 4.3. Build the RPM
 
