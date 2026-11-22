@@ -30,7 +30,7 @@ var configuredActionPattern = regexp.MustCompile(`^\['set', '([^']+)', 'addactio
 // Reads the actions every jail is configured with from a "fail2ban-client -d" dump.
 func parseConfiguredActions(dump string) (jails []string, actions map[string][]string) {
 	actions = make(map[string][]string)
-	for _, line := range strings.Split(dump, "\n") {
+	for line := range strings.SplitSeq(dump, "\n") {
 		m := configuredActionPattern.FindStringSubmatch(strings.TrimSpace(line))
 		if m == nil {
 			continue
@@ -47,7 +47,7 @@ func parseConfiguredActions(dump string) (jails []string, actions map[string][]s
 func parseRunningActions(output string) []string {
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	var names []string
-	for _, name := range strings.Split(lines[len(lines)-1], ",") {
+	for name := range strings.SplitSeq(lines[len(lines)-1], ",") {
 		if name = strings.TrimSpace(name); name != "" {
 			names = append(names, name)
 		}

@@ -21,6 +21,7 @@ import (
 	"bufio"
 	"context"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"strings"
@@ -63,9 +64,7 @@ func (s *Service) BanLogLines(ctx context.Context, jail string, ips []string) ma
 	if len(missing) > 0 {
 		// Best effort: a journal that cannot be read completely still contributes the lines read so far.
 		journal, _ := journalLinesNewestFirst(ctx)
-		for ip, found := range collectBanLogMatches(journal, missing, banLogMaxLines) {
-			matches[ip] = found
-		}
+		maps.Copy(matches, collectBanLogMatches(journal, missing, banLogMaxLines))
 	}
 	for ip, found := range matches {
 		if len(found) > 0 {
@@ -77,7 +76,7 @@ func (s *Service) BanLogLines(ctx context.Context, jail string, ips []string) ma
 
 func parseMonitoredLogpaths(output string) []string {
 	var paths []string
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		line = strings.TrimSpace(line)
 		for _, prefix := range []string{"|- ", "`- "} {
 			if path, ok := strings.CutPrefix(line, prefix); ok && strings.HasPrefix(strings.TrimSpace(path), "/") {

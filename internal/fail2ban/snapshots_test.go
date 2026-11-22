@@ -35,7 +35,7 @@ func TestConfigurationSnapshotExactRestoreAndIdempotency(t *testing.T) {
 	if err := s.BackupConfiguration("op1"); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if err := s.RestoreConfiguration("op1"); err != nil {
 			t.Fatal(err)
 		}
