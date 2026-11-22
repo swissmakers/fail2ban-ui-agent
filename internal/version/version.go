@@ -17,4 +17,4 @@
 package version
 
 // Agent version
-const Version = "0.3.0"
+const Version = "1.1.0"
