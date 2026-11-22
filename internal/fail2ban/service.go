@@ -347,6 +347,9 @@ func (s *Service) Restart(ctx context.Context) (string, error) {
 	if _, err := s.client(ctx, longCommandTimeout, "reload"); err != nil {
 		return "reload", errors.Join(append(errs, fmt.Errorf("fallback reload: %w", err))...)
 	}
+	if _, err := s.restartJailsMissingActions(ctx); err != nil {
+		return "reload", err
+	}
 	return "reload", nil
 }
 

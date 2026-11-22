@@ -607,3 +607,20 @@ func TestDeleteReturnsNotFound(t *testing.T) {
 		t.Fatalf("DeleteJail: %v", err)
 	}
 }
+
+// Without a service manager a restart is a reload, which drops newly added actions like any other.
+func TestRestartFallbackRestartsJailsThatLostAnAction(t *testing.T) {
+	root := t.TempDir()
+	argv := filepath.Join(t.TempDir(), "argv")
+	fakeTools(t, map[string]string{"fail2ban-client": fakeClient(root, `-d) printf '%s\n' "['set', 'sshd', 'addaction', 'nftables-multiport']" "['set', 'sshd', 'addaction', 'ui-custom-action']" ;;
+get) printf 'The jail sshd has the following actions:\nui-custom-action\n' ;;
+reload) echo "$*" >> `+argv+` ;;`)})
+	mode, err := NewService(root, "/var/log").Restart(context.Background())
+	if err != nil || mode != "reload" {
+		t.Fatalf("Restart() = %q, %v", mode, err)
+	}
+	raw, _ := os.ReadFile(argv)
+	if string(raw) != "reload\nreload --restart sshd\n" {
+		t.Fatalf("reload calls = %q", raw)
+	}
+}

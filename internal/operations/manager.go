@@ -295,6 +295,10 @@ func (m *Manager) run(id string) {
 		op.State, op.Error = "failed", result.Err.Error()
 		if op.Kind != "validate" {
 			op.State, op.Code, op.Quiescent = "unknown", "outcome_unknown", false
+			// The command ran into its time limit, so the daemon received it and may still finish it.
+			if errors.Is(result.Err, context.DeadlineExceeded) {
+				op.Code = "command_timeout"
+			}
 		}
 	}
 	m.mu.Lock()
