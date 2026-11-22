@@ -55,6 +55,37 @@ esac`})
 	}
 }
 
+func TestReloadRestartOperationIsAdvertisedAndDispatched(t *testing.T) {
+	fakeTools(t, map[string]string{"fail2ban-client": `[ "$1" = "-c" ] && shift 2
+case "$1" in
+reload) [ "$2" = "--restart" ] && echo restarted || exit 3 ;;
+ping) echo pong ;;
+*) exit 1 ;;
+esac`})
+	h := newHarness(t)
+	caps := h.do(http.MethodGet, "/v1/operations/capabilities", "", true)
+	if !strings.Contains(caps.Body.String(), `"reload-restart"`) {
+		t.Fatalf("capabilities do not advertise reload-restart: %s", caps.Body.String())
+	}
+	if got := h.do(http.MethodPost, "/v1/operations", `{"id":"jails","kind":"reload-restart"}`, true); got.Code != http.StatusAccepted {
+		t.Fatalf("submit: %d %s", got.Code, got.Body.String())
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		var op operations.Operation
+		if err := json.Unmarshal(h.do(http.MethodGet, "/v1/operations/jails", "", true).Body.Bytes(), &op); err != nil {
+			t.Fatal(err)
+		}
+		if op.State == "succeeded" && strings.Contains(op.Output, "restarted") {
+			return
+		}
+		if op.State == "failed" || time.Now().After(deadline) {
+			t.Fatalf("reload-restart not dispatched: %+v", op)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestOperationEndpointsRequireAuthentication(t *testing.T) {
 	h := newHarness(t)
 	for _, path := range []string{"/v1/operations/capabilities", "/v1/operations/id"} {

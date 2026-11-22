@@ -1,5 +1,5 @@
 Name:           fail2ban-ui-agent
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Fail2ban UI Agent
 License:        AGPL-3.0-only
@@ -39,6 +39,10 @@ install -D -m 0644 packaging/systemd/fail2ban-ui-agent.service %{buildroot}%{_un
 %{_unitdir}/fail2ban-ui-agent.service
 
 %changelog
+* Sat Nov 21 2026 Swissmakers <support@swissmakers.ch> - 0.3.0-1
+- New reload-restart operation, restart jails that lost an action after a reload
+- Write action.d/nftables.local so a stopping jail keeps the shared nftables table
+
 * Wed Sep 30 2026 Swissmakers <support@swissmakers.ch> - 0.2.0-1
 - Health endpoints, supervised remediation with backoff, reliable callback queue
 - Refuse weak AGENT_SECRET values AGENT_FAIL2BAN_RUN_DIR removed

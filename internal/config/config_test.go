@@ -283,13 +283,13 @@ func TestResolveCallback(t *testing.T) {
 		wantHost   string
 		wantErr    bool
 	}{
-		{name: "store wins over env", store: ptr(validCallback("srv-store")), env: env, wantSource: CallbackSourceStore, wantID: "srv-store"},
+		{name: "store wins over env", store: new(validCallback("srv-store")), env: env, wantSource: CallbackSourceStore, wantID: "srv-store"},
 		{name: "env when store absent", env: env, wantSource: CallbackSourceEnv, wantID: "srv-env"},
 		{name: "env when store incomplete", raw: `{"serverId":"srv-store"}`, env: env, wantSource: CallbackSourceEnv, wantID: "srv-env"},
 		{name: "incomplete env ignored", env: CallbackRuntimeConfig{CallbackURL: env.CallbackURL}, wantSource: CallbackSourceNone},
 		{name: "nothing configured", wantSource: CallbackSourceNone},
 		{name: "env hostname fills a store without one", raw: `{"serverId":"srv-store","callbackUrl":"https://ui.example.com","callbackSecret":"cb-secret-1"}`, env: CallbackRuntimeConfig{CallbackHost: "web01"}, wantSource: CallbackSourceStore, wantID: "srv-store", wantHost: "web01"},
-		{name: "store hostname beats env", store: ptr(validCallback("srv-store")), env: CallbackRuntimeConfig{CallbackHost: "web01"}, wantSource: CallbackSourceStore, wantID: "srv-store", wantHost: "agent-host"},
+		{name: "store hostname beats env", store: new(validCallback("srv-store")), env: CallbackRuntimeConfig{CallbackHost: "web01"}, wantSource: CallbackSourceStore, wantID: "srv-store", wantHost: "agent-host"},
 		{name: "invalid store does not fall back", raw: `{"serverId":"srv-x","callbackUrl":"https://u:p@ui","callbackSecret":"s"}`, env: env, wantSource: CallbackSourceNone, wantErr: true},
 		{name: "corrupt store does not fall back", raw: `{not json`, env: env, wantSource: CallbackSourceNone, wantErr: true},
 	}
@@ -313,8 +313,6 @@ func TestResolveCallback(t *testing.T) {
 		})
 	}
 }
-
-func ptr[T any](v T) *T { return &v }
 
 func TestSaveCallbackRuntimeConfig(t *testing.T) {
 	root := t.TempDir()

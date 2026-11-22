@@ -53,7 +53,7 @@ func TestSupervisorDefersWhileKnownOperationRunsAndResumes(t *testing.T) {
 	ops := &fakeOps{pingErr: errors.New("socket busy")}
 	ops.busy.Store(true)
 	s := New(ops, Policy{Interval: time.Second, MaxRetries: 1, AutoReload: true})
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		s.check(context.Background())
 	}
 	if ops.reloads.Load() != 0 || s.State().ConsecutiveFails != 0 {
@@ -70,8 +70,7 @@ func TestSupervisorWakeRefreshesBeforeNextScheduledTick(t *testing.T) {
 	ops := &fakeOps{busyObserved: make(chan struct{}, 1)}
 	ops.busy.Store(true)
 	s := New(ops, Policy{Interval: time.Hour, MaxRetries: 1, AutoReload: true, AutoRestart: true})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go s.Start(ctx)
 	select {
 	case <-ops.busyObserved:
@@ -257,7 +256,7 @@ func TestSupervisorSuspendsAfterMaxAttempts(t *testing.T) {
 	clock := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
 	ops := &fakeOps{pingErr: errors.New("down")}
 	s := newTestSupervisor(ops, Policy{Interval: time.Second, MaxRetries: 1, AutoRestart: true}, &clock)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		s.check(context.Background())
 		clock = clock.Add(time.Hour)
 	}

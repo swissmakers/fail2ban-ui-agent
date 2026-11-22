@@ -101,8 +101,8 @@ func TestRestartNeverReplaysUnknownOperation(t *testing.T) {
 	<-f.start
 	m.Close()
 	op := awaitState(t, m, "op1", "unknown")
-	if op.Quiescent {
-		t.Fatal("interrupted command treated as complete")
+	if op.Quiescent || op.Code != "outcome_unknown" {
+		t.Fatalf("interrupted command treated as complete or timed out: %+v", op)
 	}
 	f2 := &fakeRunner{finish: make(chan struct{})}
 	f2.quiet.Store(true)
@@ -214,5 +214,19 @@ func TestBanTargetCannotChangeUnderSameID(t *testing.T) {
 	op := awaitState(t, m, "ban1", "succeeded")
 	if op.Jail != "sshd" || op.IP != "192.0.2.1" || f.calls.Load() != 1 {
 		t.Fatalf("ban target not preserved: %+v", op)
+	}
+}
+
+// The UI must not repeat a command that ran into the time limit; the daemon may still finish it.
+func TestTimedOutCommandIsReportedAsTimeout(t *testing.T) {
+	f := &fakeRunner{finish: make(chan struct{})}
+	m := New(t.TempDir(), f)
+	t.Cleanup(m.Close)
+	m.timeout = 10 * time.Millisecond
+	if _, err := m.Submit("slow", "reload-restart"); err != nil {
+		t.Fatal(err)
+	}
+	if op := awaitState(t, m, "slow", "unknown"); op.Code != "command_timeout" {
+		t.Fatalf("code = %q, want command_timeout", op.Code)
 	}
 }

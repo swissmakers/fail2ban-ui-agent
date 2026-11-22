@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,9 +61,8 @@ var restartCommands = [][]string{
 }
 
 type Service struct {
-	configRoot string
-	logRoot    string
-	// Serializes reload/restart/validate between the API and the supervisor; a channel so waiting honours ctx.
+	configRoot       string
+	logRoot          string
 	svcLock          chan struct{}
 	operationPending atomic.Bool
 	serviceRunning   atomic.Bool
@@ -287,7 +287,29 @@ func (s *Service) Reload(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer s.unlockService()
-	return s.client(ctx, longCommandTimeout, "reload")
+	if err := s.ensureNftablesFix(); err != nil {
+		log.Printf("warning: could not apply the nftables grep fix: %v", err)
+	}
+	out, err := s.client(ctx, longCommandTimeout, "reload")
+	if err != nil {
+		return out, err
+	}
+	restarted, err := s.restartJailsMissingActions(ctx)
+	if restarted != "" {
+		out = strings.TrimRight(out, "\n") + "\n" + restarted
+	}
+	return out, err
+}
+
+func (s *Service) ReloadRestart(ctx context.Context) (string, error) {
+	if err := s.lockService(ctx); err != nil {
+		return "", err
+	}
+	defer s.unlockService()
+	if err := s.ensureNftablesFix(); err != nil {
+		log.Printf("warning: could not apply the nftables grep fix: %v", err)
+	}
+	return s.client(ctx, max(longCommandTimeout, mutationCommandTimeout(ctx)), "reload", "--restart")
 }
 
 func mutationCommandTimeout(ctx context.Context) time.Duration {
@@ -303,6 +325,9 @@ func (s *Service) Restart(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer s.unlockService()
+	if err := s.ensureNftablesFix(); err != nil {
+		log.Printf("warning: could not apply the nftables grep fix: %v", err)
+	}
 	var errs []error
 	for _, c := range restartCommands {
 		if _, err := exec.LookPath(c[0]); err != nil {
@@ -321,6 +346,9 @@ func (s *Service) Restart(ctx context.Context) (string, error) {
 	// fallback if service manager is unavailable or failed
 	if _, err := s.client(ctx, longCommandTimeout, "reload"); err != nil {
 		return "reload", errors.Join(append(errs, fmt.Errorf("fallback reload: %w", err))...)
+	}
+	if _, err := s.restartJailsMissingActions(ctx); err != nil {
+		return "reload", err
 	}
 	return "reload", nil
 }

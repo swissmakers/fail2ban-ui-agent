@@ -32,7 +32,7 @@ func TestWriteConfigPreservesBackupOnRetry(t *testing.T) {
 	if err := os.Chmod(path, 0640); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if err := WriteConfig(path, []byte("[sshd]\nenabled = true\n"), 0644); err != nil {
 			t.Fatal(err)
 		}
